@@ -43,13 +43,31 @@ CONFLICT_NOTES = list(_SCHEDULE.get("notes", []))
 YEAR, MONTHS = 2026, (9, 10)
 TODAY = date.today()
 
-TIER_COLOR = {"A": "#d4380d", "B": "#1677ff", "C": "#8c8c8c"}
-TIER_LABEL = {"A": "必去", "B": "建议", "C": "可选"}
+TIER_COLOR = {"A": "#d4380d", "B": "#1677ff", "C": "#8c8c8c",
+              "D": "#722ed1", "S": "#fa8c16"}
+TIER_LABEL = {"A": "必去", "B": "建议", "C": "可选",
+              "D": "待判断(JD/方向命中)", "S": "国企标记(自行判断)"}
+TIER_ORDER = ["A", "B", "C", "D", "S"]
+
+_STRIP_PHRASES = ["2027届", "2027 届", "2027", "校园招聘", "校招", "宣讲会",
+                  "全球", "秋季", "正式启动", "简章", "招聘", "有限公司",
+                  "股份有限公司", "集团"]
+
+
+def shorten(theme: str, limit: int = 11) -> str:
+    t = theme
+    for p in _STRIP_PHRASES:
+        t = t.replace(p, "")
+    parts = [p for p in re.split(r"[｜|]", t) if p.strip()]
+    if len(parts) > 1:
+        t = parts[-1]
+    t = re.sub(r"[\s—\-—\"“”]+", "", t)
+    return t[:limit]
 
 
 def tier_of(theme: str) -> tuple[str | None, str | None]:
-    for tier, keys in TIER_MAP.items():
-        for k in keys:
+    for tier in TIER_ORDER:
+        for k in TIER_MAP.get(tier, []):
             if k in theme:
                 return tier, k
     return None, None
@@ -57,7 +75,11 @@ def tier_of(theme: str) -> tuple[str | None, str | None]:
 
 def load_events() -> dict[date, list[dict]]:
     events: dict[date, list[dict]] = {}
+    section = ""
     for line in MATCHES_MD.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            section = line[3:]
+            continue
         if not line.startswith("| 20"):
             continue
         cols = [c.strip() for c in line.strip().strip("|").split("|")]
@@ -68,11 +90,17 @@ def load_events() -> dict[date, list[dict]]:
             continue
         d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         tier, key = tier_of(cols[1])
-        if tier is None:
+        if tier:
+            name = SHORT_NAME.get(key, key)
+        elif "国企" in section:
+            tier, name = "S", shorten(cols[1])
+        elif "JD 正文" in section or "方向相关" in section:
+            tier, name = "D", shorten(cols[1])
+        else:
             continue
         events.setdefault(d, []).append({
             "time": m.group(4).split("-")[0],
-            "name": SHORT_NAME.get(key, key),
+            "name": name,
             "tier": tier,
         })
     for day_events in events.values():
@@ -130,10 +158,10 @@ def main():
     for ax, month in zip(axes, MONTHS):
         draw_month(ax, YEAR, month, events)
 
-    handles = [plt.Rectangle((0, 0), 1, 1, color=TIER_COLOR[t]) for t in "ABC"]
-    fig.legend(handles, [f"{t} 级 · {TIER_LABEL[t]}" for t in "ABC"],
-               loc="upper right", fontsize=13, frameon=False, ncol=3,
-               bbox_to_anchor=(0.98, 1.0))
+    handles = [plt.Rectangle((0, 0), 1, 1, color=TIER_COLOR[t]) for t in TIER_ORDER]
+    fig.legend(handles, [f"{t} 级 · {TIER_LABEL[t]}" for t in TIER_ORDER],
+               loc="upper right", fontsize=11, frameon=False, ncol=5,
+               bbox_to_anchor=(0.99, 0.965))
     fig.suptitle("USTC 2027 届秋招宣讲会日程表（9–10 月 · 已按简历匹配分级）",
                  fontsize=24, fontweight="bold", x=0.02, ha="left")
 

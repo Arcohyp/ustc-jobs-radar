@@ -326,9 +326,10 @@ def main():
             d = parse_hold_date(r)
             url = f"https://job.ustc.edu.cn/Specialrecruitment/info.aspx?itemid={r['ID']}"
             mark = " ✅" if is_new.get(r["ID"]) else ""
-            md.append(f"| {d} {clean_html(r.get('TimeSlotText',''))} | "
-                      f"{clean_html(r.get('Theme',''))} | {note} | "
-                      f"{clean_html(r.get('VenuesName',''))} | {url} |{mark} |")
+            cell = lambda s: clean_html(str(s or "")).replace("|", "｜")
+            md.append(f"| {d} {cell(r.get('TimeSlotText',''))} | "
+                      f"{cell(r.get('Theme',''))} | {cell(note)} | "
+                      f"{cell(r.get('VenuesName',''))} | {url} |{mark} |")
     report = DATA_DIR / "matches.md"
     report.write_text("\n".join(md) + "\n", encoding="utf-8")
     print(f"已保存：{report}（匹配 {len(matched)} 场）")
