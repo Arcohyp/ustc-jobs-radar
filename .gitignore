@@ -1,0 +1,13 @@
+# 个人画像（含求职偏好，切勿提交）
+profile.yaml
+
+# 抓取产物与日志（可重新生成）
+data/
+logs/
+
+# 字体文件（OFL 许可，用 tools 说明自行提取，不入库）
+fonts/
+
+__pycache__/
+*.pyc
+.DS_Store

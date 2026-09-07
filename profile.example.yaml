@@ -1,0 +1,47 @@
+# 求职画像示例配置。复制为 profile.yaml 后按自己的求职意向修改：
+#   cp profile.example.yaml profile.yaml
+# profile.yaml 为个人私有文件，已在 .gitignore 中排除，不会被提交。
+
+# 目标企业：出现在宣讲会标题里即命中，value 为额外别名列表
+target_companies:
+  华为: []
+  腾讯: []
+  阿里巴巴: ["阿里"]
+
+# 值得一看：非目标清单但方向相关，value 为显示在报告里的理由
+worth_a_look:
+  商汤: AI 视觉方向示例
+  旷视: AI 视觉方向示例
+
+# 方向关键词：兜底打分，标题命中 >=2 个进入"方向相关"档
+direction_keywords:
+  - 算法
+  - 视觉
+  - AI
+  - 人工智能
+  - 大模型
+  - 机器人
+  - 芯片
+  - 软件
+
+# 央国企信号词：标题出现则标记到独立分档提醒（可自行增删）
+soe_hints:
+  - 中物院
+  - 中核
+  - 航天
+  - 中电科
+  - 国家电网
+  - 中国移动
+  - 银行
+
+# 例外名单：命中 soe_hints 但不标记（如本地可接受的央国企）
+soe_allowed: []
+
+# 日程图分级（render_schedule.py 用）：按宣讲会标题关键词归入 A/B/C 档
+schedule:
+  tiers:
+    A: ["华为"]
+    B: ["商汤"]
+    C: []
+  short_names: {}
+  notes: []
