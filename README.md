@@ -4,12 +4,14 @@
 
 ## 功能
 
-- **增量抓取**：就业网公开 JSON 接口，串行请求 + 礼貌延迟（1.5~2.5s/次），单日全量约 25 次请求
+- **增量抓取**：就业网公开 JSON 接口，串行请求 + 礼貌延迟（1.5~2.5s/次）
 - **自动清理**：剔除举办日期早于今天的场次
+- **详情正文缓存**：`data/details.jsonl` 覆盖全部未开始场次，仅对新场次增量补抓（首次全量约几分钟，之后每天几次请求）
 - **画像匹配**（纯关键词规则，无 LLM）：
   - 🎯 目标企业：标题命中目标清单（含别名）
-  - ⚠️ 央国企标记：标题命中信号词则单独分档提醒（支持例外名单）
+  - ⚠️ 央国企标记：标题命中信号词或国企名录（`soe_names.txt`，可选）则单独分档提醒（支持例外名单）
   - 🔎 值得一看：方向高度相关的非清单企业，附关联理由
+  - 📄 JD 正文命中：标题未命中但详情正文命中 ≥2 个强关键词（防漏网，如"岚图汽车"标题无方向词但 JD 里有 VLA/世界模型）
   - 🔍 方向相关：标题命中 ≥2 个方向关键词兜底
 - **日历图**：双月日历视图，按 A/B/C 优先级着色，标注撞车取舍
 - **钉钉日报**：每日推送新增匹配 + 分档摘要（复用 [dingtalk-server-monitor](https://github.com/Arcohyp/dingtalk-server-monitor) 的 notifier）
@@ -19,8 +21,8 @@
 ```bash
 pip install -r requirements.txt
 cp profile.example.yaml profile.yaml   # 然后按自己的求职意向修改
-python3 collect.py                     # 全量更新 + 匹配
-python3 collect.py --details           # 额外抓取匹配场次的详情正文
+python3 collect.py                     # 全量更新 + 详情补抓 + 匹配
+python3 collect.py --no-details        # 跳过详情抓取，只按标题匹配（快）
 python3 collect.py --offline           # 不联网，用本地存储重新生成报告（调规则用）
 python3 render_schedule.py             # 生成 data/schedule.png 日历图
 ```
@@ -62,6 +64,10 @@ for src, out in [('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc', 'Not
             break
 "
 ```
+
+## 国企名录（可选）
+
+如果你有地方国企名录，把公司名一行一个存为项目根目录的 `soe_names.txt` 即自动生效（标题含名录内公司名或其短名即标记）。该文件已在 `.gitignore` 中排除，**请勿将名录本身提交或外传**。
 
 ## 合规说明
 

@@ -13,11 +13,13 @@
   抓取列表 -> 与 data/list_store.jsonl 合并（按 ID 去重，记录 first_seen）
             -> 剔除举办日期早于今天的场次
             -> 输出 data/upcoming.csv（未开始的全部场次）
-            -> 按 resume/ 下的求职画像做关键词匹配，输出 data/matches.md
+            -> 详情正文缓存 data/details.jsonl（覆盖全部未开始场次，增量补抓）
+            -> 按 profile.yaml 求职画像匹配：标题四档 + JD 正文兜底，输出 data/matches.md
 
 用法：
-  python3 collect.py                # 全量更新（默认即增量：合并去重+剔过期+匹配）
-  python3 collect.py --details      # 额外抓取匹配场次的详情正文（数量少，几分钟）
+  python3 collect.py                # 全量更新（合并去重+剔过期+补详情+匹配）
+  python3 collect.py --no-details   # 跳过详情抓取，只按标题匹配（快）
+  python3 collect.py --offline      # 不访问网络，用本地存储重新生成报告
   python3 collect.py --keyword 华为  # 只按关键词抓列表（调试用）
 """
 
@@ -37,6 +39,7 @@ import yaml
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
 STORE_PATH = DATA_DIR / "list_store.jsonl"
+DETAIL_PATH = DATA_DIR / "details.jsonl"
 LIST_API = "https://ustc.ahbys.com/API/Web/index10358.ashx"
 INFO_API = "https://job.ustc.edu.cn/Ajax/jywapi.ashx"
 PAGE_SIZE = 200  # 接口实测支持
@@ -68,6 +71,34 @@ WORTH_A_LOOK = _PROFILE.get("worth_a_look", {})
 DIRECTION_KEYWORDS = _PROFILE.get("direction_keywords", [])
 SOE_HINTS = _PROFILE.get("soe_hints", [])
 SOE_ALLOWED = _PROFILE.get("soe_allowed", [])
+JD_KEYWORDS = _PROFILE.get("jd_keywords", [])
+JD_MIN_HITS = 2
+
+_SOE_CORP_SUFFIXES = ("集团有限责任公司", "股份有限公司", "有限责任公司",
+                      "有限公司", "总公司")
+
+
+def load_soe_names():
+    """加载国企名录（soe_names.txt，本地私有文件），并自动补短名（去公司后缀）"""
+    path = BASE / "soe_names.txt"
+    names = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name = line.strip()
+            if not name:
+                continue
+            names.add(name)
+            short = name
+            for suf in _SOE_CORP_SUFFIXES:
+                if short.endswith(suf):
+                    short = short[: -len(suf)]
+                    break
+            if len(short) >= 4:
+                names.add(short)
+    return names
+
+
+SOE_NAMES = load_soe_names()
 
 
 def polite_get(url, params=None, post=False, data=None):
@@ -134,7 +165,8 @@ def match_row(row):
     """返回 (档位, 命中名, 理由, 是否疑似国企)。
     档位: 'target' 目标企业 / 'worth' 值得一看 / 'direction' 方向相关 / None"""
     title = row.get("Theme", "")
-    is_soe = (any(h in title for h in SOE_HINTS)
+    is_soe = ((any(h in title for h in SOE_HINTS)
+               or any(n in title for n in SOE_NAMES))
               and not any(a in title for a in SOE_ALLOWED))
     for name, aliases in TARGET_COMPANIES.items():
         if name in title or any(a in title for a in aliases):
@@ -148,10 +180,56 @@ def match_row(row):
     return None, None, "", is_soe
 
 
+def match_detail(row, details):
+    """标题未命中时兜底：JD 正文命中 >=JD_MIN_HITS 个强关键词则进 'detail' 档"""
+    d = details.get(row["ID"])
+    if not d or not JD_KEYWORDS:
+        return None, ""
+    text = d.get("DescriptionText", "")
+    hits = [k for k in JD_KEYWORDS if k in text]
+    if len(hits) >= JD_MIN_HITS:
+        return "detail", "JD 命中: " + "/".join(hits[:6])
+    return None, ""
+
+
+def load_details():
+    cache = {}
+    if DETAIL_PATH.exists():
+        for line in DETAIL_PATH.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                d = json.loads(line)
+                cache[d["ID"]] = d
+    return cache
+
+
+def save_details(cache):
+    with DETAIL_PATH.open("w", encoding="utf-8") as f:
+        for d in cache.values():
+            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+
+def fetch_missing_details(ids, cache, offline):
+    missing = [i for i in ids if i not in cache]
+    if offline or not missing:
+        return
+    print(f"需补抓 {len(missing)} 场详情（约 {len(missing) * 2 // 60 + 1} 分钟）")
+    for n, iid in enumerate(missing, 1):
+        try:
+            d = polite_get(INFO_API, post=True,
+                           data={"action": "bookinginfo", "rid": iid}).json()
+            d["ID"] = iid
+            d["DescriptionText"] = clean_html(d.get("Description", ""))
+            cache[iid] = d
+        except Exception as e:
+            print(f"  详情 {iid} 失败：{e}")
+        if n % 10 == 0:
+            print(f"  详情进度 {n}/{len(missing)}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--details", action="store_true",
-                    help="抓取匹配场次的详情正文（几分钟）")
+    ap.add_argument("--no-details", action="store_true",
+                    help="不抓详情正文（只用标题匹配，速度快）")
     ap.add_argument("--keyword", default="", help="关键词过滤（调试用）")
     ap.add_argument("--offline", action="store_true",
                     help="不访问网络，只用本地存储重新生成报告（调匹配规则用）")
@@ -208,10 +286,22 @@ def main():
             w.writerow({k: clean_html(str(r.get(k, ""))) for k in LIST_FIELDS + ["first_seen"]})
     print(f"已保存：{csv_path}")
 
-    # ---- 匹配 ----
+    # ---- 详情缓存：覆盖全部未开始场次，剔除已过期，补抓缺失 ----
+    details = load_details()
+    before = len(details)
+    details = {i: d for i, d in details.items() if i in store}
+    if len(details) < before:
+        print(f"详情缓存剔除过期 {before - len(details)} 条，剩 {len(details)} 条")
+    if not args.no_details:
+        fetch_missing_details([r["ID"] for r in upcoming], details, args.offline)
+    save_details(details)
+
+    # ---- 匹配：标题优先，标题未命中再查 JD 正文 ----
     matched = []
     for r in upcoming:
         tier, name, note, is_soe = match_row(r)
+        if not tier:
+            tier, note = match_detail(r, details)
         if tier:
             matched.append((tier, name, note, is_soe, r))
 
@@ -220,6 +310,7 @@ def main():
     groups = [("## 🎯 目标企业（投递清单内）", "target", False),
               ("## ⚠️ 匹配但疑似国企/央企属性", None, True),
               ("## 🔎 值得一看（方向高度相关）", "worth", False),
+              ("## 📄 JD 正文命中（标题未命中）", "detail", False),
               ("## 🔍 方向相关（兜底关键词）", "direction", False)]
     for title, tier, soe_filter in groups:
         if soe_filter:
@@ -241,33 +332,6 @@ def main():
     report = DATA_DIR / "matches.md"
     report.write_text("\n".join(md) + "\n", encoding="utf-8")
     print(f"已保存：{report}（匹配 {len(matched)} 场）")
-
-    # ---- 可选：抓匹配场次的详情 ----
-    if args.details and matched:
-        detail_path = DATA_DIR / "details.jsonl"
-        done = set()
-        if detail_path.exists():
-            done = {json.loads(l)["ID"] for l in
-                    detail_path.read_text(encoding="utf-8").splitlines() if l.strip()}
-        with detail_path.open("a", encoding="utf-8") as f:
-            for _, _, _, _, r in matched:
-                iid = r["ID"]
-                if iid in done:
-                    continue
-                if args.offline:
-                    print("  离线模式跳过详情抓取")
-                    break
-                try:
-                    d = polite_get(INFO_API, post=True,
-                                   data={"action": "bookinginfo", "rid": iid}).json()
-                    d["ID"] = iid
-                    d["DescriptionText"] = clean_html(d.get("Description", ""))
-                    f.write(json.dumps(d, ensure_ascii=False) + "\n")
-                    f.flush()
-                    print(f"  详情：{clean_html(d.get('Theme',''))[:30]}")
-                except Exception as e:
-                    print(f"  详情 {iid} 失败：{e}")
-        print(f"详情已保存：{detail_path}")
 
 
 if __name__ == "__main__":
