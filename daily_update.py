@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -28,6 +29,11 @@ BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"
 MATCHES_MD = DATA / "matches.md"
 LOG_DIR = BASE / "logs"
+
+# 上游接口（ustc.ahbys.com 第三方厂商）偶发故障（如整站 502），
+# 失败时间隔重试；仍失败则降级用本地缓存出日报，保证推送不中断。
+COLLECT_RETRIES = 3          # 共尝试 3 次
+COLLECT_RETRY_WAIT = 300     # 每次失败等 5 分钟再试
 
 _dsm_root = os.environ.get("DSM_ROOT", "")
 if not _dsm_root or not (Path(_dsm_root) / "core" / "notifier.py").exists():
@@ -60,6 +66,10 @@ def parse_matches(md_text: str) -> dict:
     m = re.search(r"未开始场次 (\d+)，其中匹配 (\d+) 场", md_text)
     if m:
         stats = {"upcoming": m.group(1), "matched": m.group(2)}
+    cache_time = ""
+    m = re.search(r"# 匹配报告（([^，]+)", md_text)
+    if m:
+        cache_time = m.group(1).strip()
 
     sections: dict[str, list[str]] = {}
     new_rows: list[str] = []
@@ -81,7 +91,7 @@ def parse_matches(md_text: str) -> dict:
             sections[current].append(row)
             if row["is_new"]:
                 new_rows.append(row)
-    return {"stats": stats, "sections": sections, "new_rows": new_rows}
+    return {"stats": stats, "cache_time": cache_time, "sections": sections, "new_rows": new_rows}
 
 
 def fmt_row(r: dict) -> str:
@@ -120,6 +130,21 @@ def build_summary(parsed: dict) -> str:
     return "\n".join(lines)
 
 
+def drop_past_rows(parsed: dict, today: date) -> dict:
+    """缓存降级时调用：collect.py 未运行，已过去的场次不会被自动剔除，
+    这里按行内日期（YYYY-MM-DD 前缀）再过滤一遍。"""
+    cutoff = f"{today:%Y-%m-%d}"
+    for title in list(parsed["sections"]):
+        parsed["sections"][title] = [
+            r for r in parsed["sections"][title] if r["date"][:10] >= cutoff
+        ]
+    parsed["new_rows"] = [r for r in parsed["new_rows"]
+                          if r["date"][:10] >= cutoff]
+    parsed["stats"]["upcoming"] = str(
+        sum(len(v) for v in parsed["sections"].values()))
+    return parsed
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
@@ -133,7 +158,30 @@ def main():
 
     if not args.dry_run and not args.no_fetch:
         ok, tail = run_collect()
+        for attempt in range(2, COLLECT_RETRIES + 1):
+            if ok:
+                break
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] collect failed, "
+                  f"retry {attempt}/{COLLECT_RETRIES} in {COLLECT_RETRY_WAIT}s")
+            time.sleep(COLLECT_RETRY_WAIT)
+            ok, tail = run_collect()
+
         if not ok:
+            # 降级：上游接口持续不可用（如厂商站点 502），
+            # 用本地缓存的 matches.md 照常出日报，仅标注数据截止时间。
+            if MATCHES_MD.exists():
+                parsed = parse_matches(MATCHES_MD.read_text(encoding="utf-8"))
+                parsed = drop_past_rows(parsed, today)
+                summary = build_summary(parsed)
+                cache_note = (f"> ⚠️ 就业网数据接口暂时不可用（抓取失败），"
+                              f"以下为 {parsed['cache_time'] or '上次成功抓取'} 的缓存数据\n\n")
+                send_notification(
+                    title=f"USTC宣讲会日报 {today}（缓存数据）",
+                    content=cache_note + summary,
+                    status="warning",
+                )
+                print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] notify=cache-fallback")
+                sys.exit(0)
             send_notification(
                 title=f"USTC宣讲会日报 {today}（抓取失败）",
                 content=f"collect.py 执行失败，输出尾部：\n```\n{tail}\n```",
