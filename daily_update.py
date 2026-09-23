@@ -35,12 +35,28 @@ LOG_DIR = BASE / "logs"
 COLLECT_RETRIES = 3          # 共尝试 3 次
 COLLECT_RETRY_WAIT = 300     # 每次失败等 5 分钟再试
 
+# 钉钉推送重试（网络/DNS 偶发抖动，避免静默失败）
+NOTIFY_RETRIES = 3           # 共尝试 3 次
+NOTIFY_RETRY_WAIT = 30       # 每次失败等 30 秒再试
+
 _dsm_root = os.environ.get("DSM_ROOT", "")
 if not _dsm_root or not (Path(_dsm_root) / "core" / "notifier.py").exists():
     sys.exit("请设置 DSM_ROOT 环境变量指向 dingtalk-server-monitor 项目目录")
 sys.path.insert(0, _dsm_root)
 
 from core.notifier import send_notification  # noqa: E402
+
+
+def send_notification_with_retry(title: str, content: str, status: str = "success") -> bool:
+    """带重试的钉钉推送，避免网络/DNS 抖动导致静默失败。"""
+    for attempt in range(1, NOTIFY_RETRIES + 1):
+        ok = send_notification(title=title, content=content, status=status)
+        if ok:
+            return True
+        if attempt < NOTIFY_RETRIES:
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] notify failed, retry {attempt+1}/{NOTIFY_RETRIES} in {NOTIFY_RETRY_WAIT}s")
+            time.sleep(NOTIFY_RETRY_WAIT)
+    return False
 
 MAX_ROWS_PER_SECTION = 15
 SECTION_TITLES = [
@@ -175,14 +191,14 @@ def main():
                 summary = build_summary(parsed)
                 cache_note = (f"> ⚠️ 就业网数据接口暂时不可用（抓取失败），"
                               f"以下为 {parsed['cache_time'] or '上次成功抓取'} 的缓存数据\n\n")
-                send_notification(
+                send_notification_with_retry(
                     title=f"USTC宣讲会日报 {today}（缓存数据）",
                     content=cache_note + summary,
                     status="warning",
                 )
                 print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] notify=cache-fallback")
                 sys.exit(0)
-            send_notification(
+            send_notification_with_retry(
                 title=f"USTC宣讲会日报 {today}（抓取失败）",
                 content=f"collect.py 执行失败，输出尾部：\n```\n{tail}\n```",
                 status="error",
@@ -193,7 +209,7 @@ def main():
         if args.dry_run:
             print("matches.md 不存在")
             sys.exit(1)
-        send_notification(
+        send_notification_with_retry(
             title=f"USTC宣讲会日报 {today}（无数据）",
             content="data/matches.md 不存在，collect.py 可能未产出报告。",
             status="error",
@@ -207,7 +223,7 @@ def main():
         print(summary)
         return
 
-    ok = send_notification(
+    ok = send_notification_with_retry(
         title=f"USTC宣讲会日报 {today}",
         content=summary,
         status="success" if not parsed["new_rows"] else "warning",
