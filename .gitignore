@@ -8,6 +8,9 @@ soe_names.txt
 data/
 logs/
 
+# 日报基于个人画像匹配，仅本地留存，不入库
+reports/
+
 # 字体文件（OFL 许可，用 tools 说明自行提取，不入库）
 fonts/
 

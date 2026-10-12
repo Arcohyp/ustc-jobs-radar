@@ -29,6 +29,7 @@ BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"
 MATCHES_MD = DATA / "matches.md"
 LOG_DIR = BASE / "logs"
+REPORTS = BASE / "reports"
 
 # 上游接口（ustc.ahbys.com 第三方厂商）偶发故障（如整站 502），
 # 失败时间隔重试；仍失败则降级用本地缓存出日报，保证推送不中断。
@@ -146,6 +147,17 @@ def build_summary(parsed: dict) -> str:
     return "\n".join(lines)
 
 
+def save_local_report(summary: str, today: date, note: str = "") -> Path:
+    """把日报摘要写到 reports/latest.md（只保留最新一期，不留历史存档）。
+
+    注意：日报内容基于个人画像匹配，仅保存本地，不入库、不上传远端。"""
+    REPORTS.mkdir(exist_ok=True)
+    content = f"# USTC宣讲会日报 {today}\n\n{note}{summary}\n"
+    latest = REPORTS / "latest.md"
+    latest.write_text(content, encoding="utf-8")
+    return latest
+
+
 def drop_past_rows(parsed: dict, today: date) -> dict:
     """缓存降级时调用：collect.py 未运行，已过去的场次不会被自动剔除，
     这里按行内日期（YYYY-MM-DD 前缀）再过滤一遍。"""
@@ -191,6 +203,8 @@ def main():
                 summary = build_summary(parsed)
                 cache_note = (f"> ⚠️ 就业网数据接口暂时不可用（抓取失败），"
                               f"以下为 {parsed['cache_time'] or '上次成功抓取'} 的缓存数据\n\n")
+                report_file = save_local_report(summary, today, note=cache_note)
+                print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] local report: {report_file}")
                 send_notification_with_retry(
                     title=f"USTC宣讲会日报 {today}（缓存数据）",
                     content=cache_note + summary,
@@ -222,6 +236,9 @@ def main():
     if args.dry_run:
         print(summary)
         return
+
+    report_file = save_local_report(summary, today)
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] local report: {report_file}")
 
     ok = send_notification_with_retry(
         title=f"USTC宣讲会日报 {today}",
