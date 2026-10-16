@@ -11,7 +11,8 @@
 
 数据流：
   抓取列表 -> 与 data/list_store.jsonl 合并（按 ID 去重，记录 first_seen）
-            -> 剔除举办日期早于今天的场次
+            -> 过期场次（举办日期早于今天）归档到 data/archive.jsonl（含 archived_at），
+               对应 JD 详情归档到 data/archive_details.jsonl，主存储只留未开始的
             -> 输出 data/upcoming.csv（未开始的全部场次）
             -> 详情正文缓存 data/details.jsonl（覆盖全部未开始场次，增量补抓）
             -> 按 profile.yaml 求职画像匹配：标题四档 + JD 正文兜底，输出 data/matches.md
@@ -40,6 +41,8 @@ BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
 STORE_PATH = DATA_DIR / "list_store.jsonl"
 DETAIL_PATH = DATA_DIR / "details.jsonl"
+ARCHIVE_PATH = DATA_DIR / "archive.jsonl"
+ARCHIVE_DETAIL_PATH = DATA_DIR / "archive_details.jsonl"
 LIST_API = "https://ustc.ahbys.com/API/Web/index10358.ashx"
 INFO_API = "https://job.ustc.edu.cn/Ajax/jywapi.ashx"
 PAGE_SIZE = 200  # 接口实测支持
@@ -161,6 +164,27 @@ def load_store():
     return store
 
 
+def load_jsonl_by_id(path):
+    """按 ID 读取 jsonl（归档文件用）。"""
+    rows = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                rows[row["ID"]] = row
+    return rows
+
+
+def append_archive(path, rows):
+    """把行追加到归档文件，按 ID 去重（上游列表若仍返回过期场次，避免重复归档）。"""
+    existing = load_jsonl_by_id(path)
+    with path.open("a", encoding="utf-8") as f:
+        for row in rows:
+            if row["ID"] in existing:
+                continue
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def match_row(row):
     """返回 (档位, 命中名, 理由, 是否疑似国企)。
     档位: 'target' 目标企业 / 'worth' 值得一看 / 'direction' 方向相关 / None"""
@@ -262,7 +286,7 @@ def main():
     else:
         is_new = {r["ID"]: False for r in rows}
 
-    # ---- 剔除过期：只保留举办日期 >= 今天的 ----
+    # ---- 过期归档：举办日期早于今天的移入 archive，主存储只留未开始的 ----
     expired = [r for r in store.values()
                if (d := parse_hold_date(r)) is None or d < today]
     upcoming = [r for r in store.values()
@@ -270,7 +294,11 @@ def main():
     upcoming.sort(key=lambda r: (parse_hold_date(r), r.get("nPos") or 0))
     for r in expired:
         del store[r["ID"]]
-    print(f"已剔除过期/无日期 {len(expired)} 场，保留未开始 {len(upcoming)} 场")
+    for r in expired:
+        r["archived_at"] = now
+    append_archive(ARCHIVE_PATH, expired)
+    print(f"已归档过期/无日期 {len(expired)} 场（累计归档 {len(load_jsonl_by_id(ARCHIVE_PATH))} 场），"
+          f"保留未开始 {len(upcoming)} 场")
 
     # ---- 写主存储与 upcoming 表 ----
     with STORE_PATH.open("w", encoding="utf-8") as f:
@@ -286,12 +314,16 @@ def main():
             w.writerow({k: clean_html(str(r.get(k, ""))) for k in LIST_FIELDS + ["first_seen"]})
     print(f"已保存：{csv_path}")
 
-    # ---- 详情缓存：覆盖全部未开始场次，剔除已过期，补抓缺失 ----
+    # ---- 详情缓存：覆盖全部未开始场次，过期归档，补抓缺失 ----
     details = load_details()
-    before = len(details)
-    details = {i: d for i, d in details.items() if i in store}
-    if len(details) < before:
-        print(f"详情缓存剔除过期 {before - len(details)} 条，剩 {len(details)} 条")
+    detail_rows = []
+    for iid in [i for i in details if i not in store]:
+        d = details.pop(iid)
+        d["archived_at"] = now
+        detail_rows.append(d)
+    append_archive(ARCHIVE_DETAIL_PATH, detail_rows)
+    if detail_rows:
+        print(f"详情归档 {len(detail_rows)} 条，详情缓存剩 {len(details)} 条")
     if not args.no_details:
         fetch_missing_details([r["ID"] for r in upcoming], details, args.offline)
     save_details(details)

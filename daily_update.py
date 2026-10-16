@@ -6,7 +6,7 @@
     30 8 * * * DSM_ROOT=/path/to/dingtalk-server-monitor /usr/bin/python3 /path/to/daily_update.py >> /path/to/logs/cron.log 2>&1
 
 流程：
-    1. 运行 collect.py（在线全量更新，自带增量合并 + 过期剔除 + 匹配）
+    1. 运行 collect.py（在线全量更新，自带增量合并 + 过期归档 + 匹配）
     2. 解析 data/matches.md，提取统计与分档表格
     3. 通过 dingtalk-server-monitor 的 notifier 推送 Markdown 摘要
     4. 任一步失败都会推送错误通知（含输出尾部），避免静默失败
