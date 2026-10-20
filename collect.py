@@ -18,7 +18,7 @@
             -> 按 profile.yaml 求职画像匹配：标题四档 + JD 正文兜底，输出 data/matches.md
 
 用法：
-  python3 collect.py                # 全量更新（合并去重+剔过期+补详情+匹配）
+  python3 collect.py                # 全量更新（合并去重+过期归档+补详情+匹配）
   python3 collect.py --no-details   # 跳过详情抓取，只按标题匹配（快）
   python3 collect.py --offline      # 不访问网络，用本地存储重新生成报告
   python3 collect.py --keyword 华为  # 只按关键词抓列表（调试用）
@@ -205,14 +205,23 @@ def match_row(row):
 
 
 def match_detail(row, details):
-    """标题未命中时兜底：JD 正文命中 >=JD_MIN_HITS 个强关键词则进 'detail' 档"""
+    """标题未命中时两级兜底：
+    1) JD 正文命中 >=JD_MIN_HITS 个强关键词 -> 'detail' 档（精确）
+    2) 否则 JD 命中 >=JD_MIN_HITS 个方向词 -> 'direction_jd' 宽松档
+       （大公司 JD 常是通用简章、无具体技术词，宽松档防漏，代价是噪音偏多）"""
     d = details.get(row["ID"])
-    if not d or not JD_KEYWORDS:
+    if not d:
         return None, ""
     text = d.get("DescriptionText", "")
-    hits = [k for k in JD_KEYWORDS if k in text]
-    if len(hits) >= JD_MIN_HITS:
-        return "detail", "JD 命中: " + "/".join(hits[:6])
+    if not text:
+        return None, ""
+    if JD_KEYWORDS:
+        hits = [k for k in JD_KEYWORDS if k in text]
+        if len(hits) >= JD_MIN_HITS:
+            return "detail", "JD 命中: " + "/".join(hits[:6])
+    dir_hits = [k for k in DIRECTION_KEYWORDS if k in text]
+    if len(dir_hits) >= JD_MIN_HITS:
+        return "direction_jd", f"JD 方向词 {len(dir_hits)} 个: " + "/".join(dir_hits[:6])
     return None, ""
 
 
@@ -343,6 +352,7 @@ def main():
               ("## ⚠️ 匹配但疑似国企/央企属性", None, True),
               ("## 🔎 值得一看（方向高度相关）", "worth", False),
               ("## 📄 JD 正文命中（标题未命中）", "detail", False),
+              ("## 🔍 JD 方向相关（宽松命中）", "direction_jd", False),
               ("## 🔍 方向相关（兜底关键词）", "direction", False)]
     for title, tier, soe_filter in groups:
         if soe_filter:
