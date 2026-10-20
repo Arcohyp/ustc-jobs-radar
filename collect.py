@@ -225,6 +225,80 @@ def match_detail(row, details):
     return None, ""
 
 
+# ---- 组团招聘会内参会单位展开 ----
+# 主题里出现这些词才展开（单公司宣讲会的 JD 不是单位表，展开无意义）
+FAIR_THEME_RE = re.compile(r"组团|双选|洽谈会|招聘会（|专场活动|人才周|校招平台")
+
+UNIT_SUFFIX_RE = re.compile(
+    r"([\u4e00-\u9fffA-Za-z0-9（）()·]{2,26}?"
+    r"(?:股份有限公司|有限责任公司|集团有限公司|有限公司|"
+    r"研究院|研究所|设计院|重点实验室|实验室|创新中心|研发中心|技术中心|工程研究中心|"
+    r"大学|学院|医院|学校|银行|分行|集团|中心|分院|工作站|基地|园区|管委会|所|院|站|局))")
+
+# 单位名里要剥掉的表头/岗位噪音词：连写文本里单位名前会粘着表头和岗位名，
+# 取最后一个噪音词之后的部分作为单位名
+_UNIT_NOISE_RE = re.compile(
+    r"单位名称|岗位名称|专业要求|招聘岗位|招聘单位|序号|"
+    r"科技人才|青年人才|研发工程师|算法工程师|工程师|专员|主管|经理|"
+    r"教师|医师|博士后|博士|硕士|科研人员|毕业生|岗位|名称|要求|详情|专业")
+
+
+def _clean_unit_name(raw: str) -> str:
+    """剥掉连写文本里粘在单位名前的表头/岗位词、展位号等前缀。"""
+    name = _UNIT_NOISE_RE.split(raw)[-1].strip("（）()、，,· ")
+    name = re.sub(r"^[^\u4e00-\u9fff]+", "", name)  # 去掉前导数字/字母/符号（展位号等）
+    return name
+
+
+def is_fair_theme(theme: str) -> bool:
+    return bool(FAIR_THEME_RE.search(theme or ""))
+
+
+def extract_units(text: str) -> list[tuple[str, str]]:
+    """从组团招聘会 JD 提取 (单位名, 岗位上下文) 列表。
+
+    JD 里的参会单位表格被抓取时压成了纯文本（单位名+岗位+专业连写无分隔），
+    用公司/机构后缀做锚点切分单位，单位名下到下一个单位名之间的文本作为
+    岗位上下文，供关键词匹配。去重保序。"""
+    if not text:
+        return []
+    matches = list(UNIT_SUFFIX_RE.finditer(text))
+    units = []
+    for i, m in enumerate(matches):
+        name = _clean_unit_name(m.group(1))
+        if len(name) < 4 or len(name) > 30:
+            continue
+        end = (matches[i + 1].start() if i + 1 < len(matches)
+               else min(len(text), m.end() + 200))
+        units.append((name, text[m.end():end]))
+    seen, out = set(), []
+    for name, ctx in units:
+        if name not in seen:
+            seen.add(name)
+            out.append((name, ctx))
+    return out
+
+
+def match_unit(name: str, ctx: str) -> tuple[str | None, str, bool]:
+    """对参会单位打分：公司名单优先，其次岗位上下文里的关键词。"""
+    is_soe = ((any(h in name for h in SOE_HINTS)
+               or any(n in name for n in SOE_NAMES))
+              and not any(a in name for a in SOE_ALLOWED))
+    for cname, aliases in TARGET_COMPANIES.items():
+        if cname in name or any(a in name for a in aliases):
+            return "target", "目标企业清单", is_soe
+    for cname, note in WORTH_A_LOOK.items():
+        if cname in name:
+            return "worth", note, is_soe
+    strong = [k for k in JD_KEYWORDS if k in ctx]
+    if strong:
+        return "detail", "岗位命中: " + "/".join(strong[:4]), is_soe
+    dirs = [k for k in DIRECTION_KEYWORDS if k in ctx]
+    if len(dirs) >= 2:
+        return "direction_jd", f"岗位方向词 {len(dirs)} 个: " + "/".join(dirs[:4]), is_soe
+    return None, "", is_soe
+
+
 def load_details():
     cache = {}
     if DETAIL_PATH.exists():
@@ -346,8 +420,20 @@ def main():
         if tier:
             matched.append((tier, name, note, is_soe, r))
 
+    # ---- 组团招聘会：展开参会单位，按岗位上下文匹配 ----
+    fair_hits = []
+    for r in upcoming:
+        if not is_fair_theme(r.get("Theme", "")):
+            continue
+        d = details.get(r["ID"], {})
+        for name, ctx in extract_units(d.get("DescriptionText", "")):
+            tier, note, is_soe = match_unit(name, ctx)
+            if tier:
+                fair_hits.append((r, name, note, is_soe, ctx))
+
     md = [f"# 匹配报告（{now}，今日 {today}）\n",
-          f"未开始场次 {len(upcoming)}，其中匹配 {len(matched)} 场。\n"]
+          f"未开始场次 {len(upcoming)}，其中匹配 {len(matched)} 场。"
+          f"（另有 {len(fair_hits)} 家团招参会单位命中，见文末专节）\n"]
     groups = [("## 🎯 目标企业（投递清单内）", "target", False),
               ("## ⚠️ 匹配但疑似国企/央企属性", None, True),
               ("## 🔎 值得一看（方向高度相关）", "worth", False),
@@ -372,6 +458,21 @@ def main():
             md.append(f"| {d} {cell(r.get('TimeSlotText',''))} | "
                       f"{cell(r.get('Theme',''))} | {cell(note)} | "
                       f"{cell(r.get('VenuesName',''))} | {url} |{mark} |")
+    if fair_hits:
+        fair_hits.sort(key=lambda x: parse_hold_date(x[0]) or date.min)
+        md.append("\n## 🏢 组团招聘会内匹配的参会单位\n")
+        md.append("| 日期 | 参会单位 | 为什么相关 | 地点 | 链接 | 新 |")
+        md.append("|---|---|---|---|---|---|")
+        for r, name, note, is_soe, ctx in fair_hits:
+            d = parse_hold_date(r)
+            url = f"https://job.ustc.edu.cn/Specialrecruitment/info.aspx?itemid={r['ID']}"
+            mark = " ✅" if is_new.get(r["ID"]) else ""
+            snip = clean_html(ctx)[:60].replace("|", "｜")
+            note_cell = f"{'⚠️国企 ' if is_soe else ''}{note}｜{snip}" if snip else note
+            md.append(f"| {d} {cell(r.get('TimeSlotText',''))} | "
+                      f"{cell(name)} | {cell(note_cell)} | "
+                      f"{cell(r.get('VenuesName',''))} | {url} |{mark} |")
+
     report = DATA_DIR / "matches.md"
     report.write_text("\n".join(md) + "\n", encoding="utf-8")
     print(f"已保存：{report}（匹配 {len(matched)} 场）")

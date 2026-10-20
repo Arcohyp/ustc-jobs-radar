@@ -20,7 +20,8 @@ import re
 from datetime import date
 from pathlib import Path
 
-from collect import (ARCHIVE_DETAIL_PATH, match_detail, match_row,
+from collect import (ARCHIVE_DETAIL_PATH, clean_html, extract_units,
+                     is_fair_theme, match_detail, match_row, match_unit,
                      parse_hold_date)
 
 BASE = Path(__file__).resolve().parent
@@ -115,6 +116,27 @@ def main():
 
     print(f"去重后 {len(companies)} 家公司")
 
+    # ---- 组团招聘会：展开归档场次的参会单位，按岗位上下文匹配 ----
+    fair_units: dict[str, dict] = {}
+    for r in archived.values():
+        if not is_fair_theme(r.get("Theme", "")):
+            continue
+        d = details.get(r["ID"], {})
+        for name, ctx in extract_units(d.get("DescriptionText", "")):
+            tier, note, is_soe = match_unit(name, ctx)
+            if not tier:
+                continue
+            hd = parse_hold_date(r)
+            u = fair_units.setdefault(name, {
+                "name": name, "themes": set(), "latest": None, "hold": "",
+                "note": note, "is_soe": is_soe, "ctx": ctx,
+            })
+            u["themes"].add(r.get("Theme", ""))
+            if hd and (u["latest"] is None or hd > u["latest"]):
+                u.update(latest=hd, hold=r.get("HoldDateTxt", ""),
+                         note=note, is_soe=is_soe, ctx=ctx)
+    print(f"团招参会单位命中 {len(fair_units)} 家")
+
     # ---- 输出报告 ----
     md = [f"# 归档挖掘：可回捞投递的公司名单（生成于 {date.today()}）",
           "",
@@ -152,6 +174,20 @@ def main():
         md.append("| 宣讲会主题 | 上次来校 | 投递邮箱 | 网申/链接 | JD 投递提示 |")
         md.append("|---|---|---|---|---|")
         md.extend(row_line(c) for c in soe_items)
+
+    if fair_units:
+        items = sorted(fair_units.values(),
+                       key=lambda u: u["latest"] or date.min, reverse=True)
+        md.append(f"\n## 🏢 组团招聘会内匹配的参会单位（{len(items)} 家）\n")
+        md.append("| 参会单位 | 最近所属场次 | 时间 | 命中 | 岗位/专业片段 |")
+        md.append("|---|---|---|---|---|")
+        for u in items:
+            cell = lambda s: s.replace("|", "｜")
+            theme = cell(max(u["themes"], key=len))
+            snip = cell(clean_html(u["ctx"])[:70]) if u["ctx"] else "—"
+            note = ("⚠️国企 " if u["is_soe"] else "") + u["note"]
+            md.append(f"| {cell(u['name'])} | {theme} | {cell(u['hold'] or '—')} "
+                      f"| {cell(note)} | {snip} |")
 
     OUT_PATH.write_text("\n".join(md) + "\n", encoding="utf-8")
     print(f"已保存：{OUT_PATH}")
