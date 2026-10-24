@@ -1,6 +1,9 @@
 # 个人画像（含求职偏好，切勿提交）
 profile.yaml
 
+# 钉钉机器人凭证（切勿提交）
+secrets.yaml
+
 # 国企名录（内部参考来源，切勿外传/提交）
 soe_names.txt
 

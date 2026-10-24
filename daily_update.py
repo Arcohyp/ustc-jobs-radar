@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """每日定时任务：更新 USTC 专场招聘会数据 + 推送钉钉摘要。
 
-由 cron 调用，每天一次（建议早晨，如 08:30），需通过 DSM_ROOT 环境变量
-指向 dingtalk-server-monitor 项目目录（用于复用其钉钉 notifier）：
-    30 8 * * * DSM_ROOT=/path/to/dingtalk-server-monitor /usr/bin/python3 /path/to/daily_update.py >> /path/to/logs/cron.log 2>&1
+由 cron 调用，每天一次（建议早晨，如 08:30）：
+    30 8 * * * /usr/bin/python3 /path/to/daily_update.py >> /path/to/logs/cron.log 2>&1
+
+钉钉凭证：环境变量 DINGTALK_WEBHOOK / DINGTALK_SECRET，
+或项目根目录 secrets.yaml（见 notifier.py 文档字符串，不入库）。
 
 流程：
     1. 运行 collect.py（在线全量更新，自带增量合并 + 过期归档 + 匹配）
     2. 解析 data/matches.md，提取统计与分档表格
-    3. 通过 dingtalk-server-monitor 的 notifier 推送 Markdown 摘要
+    3. 通过本地 notifier.py 推送 Markdown 摘要
     4. 任一步失败都会推送错误通知（含输出尾部），避免静默失败
 
 调试：
@@ -17,7 +19,6 @@
 """
 
 import argparse
-import os
 import re
 import subprocess
 import sys
@@ -40,12 +41,9 @@ COLLECT_RETRY_WAIT = 300     # 每次失败等 5 分钟再试
 NOTIFY_RETRIES = 3           # 共尝试 3 次
 NOTIFY_RETRY_WAIT = 30       # 每次失败等 30 秒再试
 
-_dsm_root = os.environ.get("DSM_ROOT", "")
-if not _dsm_root or not (Path(_dsm_root) / "core" / "notifier.py").exists():
-    sys.exit("请设置 DSM_ROOT 环境变量指向 dingtalk-server-monitor 项目目录")
-sys.path.insert(0, _dsm_root)
+sys.path.insert(0, str(BASE))
 
-from core.notifier import send_notification  # noqa: E402
+from notifier import send_notification  # noqa: E402
 
 
 def send_notification_with_retry(title: str, content: str, status: str = "success") -> bool:
