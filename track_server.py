@@ -32,6 +32,16 @@ TRACKING_PATH = DATA_DIR / "tracking.json"
 TAGS_PATH = DATA_DIR / "tags.json"
 PORT = 8123
 
+# IP 白名单：仅本机回环 + 指定局域网主机可访问，其余连接 403。
+# 本机当前为 .110（eno2np1，用户原话 190 经核实是另一台设备），另一台主机多网卡 61/100；
+# 路由器 DHCP 若换 IP 需同步改这里。
+ALLOWED_CLIENTS = frozenset({
+    "127.0.0.1", "::1", "::ffff:127.0.0.1",
+    "192.168.31.110",
+    "192.168.31.61",
+    "192.168.31.100",
+})
+
 # 快速连点时多个 POST 可能并发到达，合并+写盘必须串行，否则读-改-写会互相覆盖
 _write_lock = threading.Lock()
 
@@ -144,7 +154,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _client_allowed(self) -> bool:
+        return self.client_address[0] in ALLOWED_CLIENTS
+
     def do_GET(self) -> None:
+        if not self._client_allowed():
+            self._send_json({"error": "forbidden"}, 403)
+            return
         path = self.path.split("?")[0]
         if path == "/api/tracking":
             self._send_json(load_tracking())
@@ -163,6 +179,9 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def do_POST(self) -> None:
+        if not self._client_allowed():
+            self._send_json({"error": "forbidden"}, 403)
+            return
         path = self.path.split("?")[0]
         if path not in ("/api/tracking", "/api/tags"):
             self._send_json({"error": "not found"}, 404)
@@ -190,8 +209,8 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"服务已启动：http://localhost:{PORT}  （Ctrl+C 停止）", flush=True)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"服务已启动：http://localhost:{PORT}  （仅白名单 IP 可访问，Ctrl+C 停止）", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
