@@ -30,12 +30,23 @@ import html
 import json
 import random
 import re
+import requests
 import time
 from datetime import date
 from pathlib import Path
 
-import requests
 import yaml
+
+
+# 省市地名表：norm_key 地域剥离、base 地识别、单位名清洗共用一份
+_CITIES = ("北京", "上海", "天津", "重庆", "广州", "深圳", "杭州", "南京", "苏州",
+           "无锡", "合肥", "成都", "武汉", "西安", "长沙", "郑州", "宁波", "厦门",
+           "青岛", "济南", "烟台", "常州", "温州", "东莞", "佛山", "珠海", "三亚",
+           "大连", "沈阳", "长春", "哈尔滨", "石家庄", "太原", "兰州", "南昌",
+           "昆明", "贵阳", "南宁", "福州", "海口", "江苏", "浙江", "安徽", "广东",
+           "山东", "四川", "湖南", "湖北", "福建", "陕西", "河南", "河北", "江西",
+           "辽宁", "吉林", "黑龙江", "内蒙古", "广西", "云南", "贵州", "海南",
+           "甘肃", "山西")
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
@@ -260,13 +271,50 @@ _UNIT_NOISE_RE = re.compile(
 # 正文散文句的特征词：单位名里出现这些说明锚点匹配到了 JD 介绍文字而非单位
 _UNIT_PROSE_MARKERS = ("交易所", "欢迎", "简介", "介绍", "投递", "招聘")
 
+# 单位表"性质"列（国企/民企…）连写时会粘到下一家单位名前
+_UNIT_NATURE_RE = re.compile(
+    r"^(国有企业|民营企业|外资企业|合资企业|事业单位|科研院所|上市公司|其他)")
+
+
+_GEO_GUARD = ("大学", "学院", "中学", "学校", "医院", "银行", "研究院", "研究所")
+
+
+def _strip_geo_column(name: str) -> str:
+    """剥单位表"城市列"（省市名连写）。只在像独立列时才剥，且剩余 ≥4 字、
+    不落入机构简称；与 norm_key 的剥法保持归并一致，同时不把注册名里的
+    城市剥掉（"合肥晶合集成电路"->保留合肥）。"""
+    for _ in range(3):
+        nxt = name
+        for city in _CITIES:
+            if not name.startswith(city):
+                continue
+            rest = name[len(city):]
+            if rest.startswith("市") and len(rest) >= 5:
+                rest2 = rest[1:]  # "深圳市腾讯"：norm_key 同样剥"深圳市"
+            else:
+                rest2 = rest
+                if not any(rest2.startswith(c) or rest2.startswith(c + "市")
+                           for c in _CITIES):
+                    continue  # 后面不是地名 -> 大概率是注册名的一部分，不剥
+            if len(rest2) >= 4 and not any(g in rest2 for g in _GEO_GUARD):
+                nxt = rest2
+                break
+        if nxt == name:
+            return name
+        name = nxt
+    return name
+
 
 def _clean_unit_name(raw: str) -> str:
-    """剥掉连写文本里粘在单位名前的表头/岗位词、展位号等前缀。"""
+    """剥掉连写文本里粘在单位名前的表头/岗位词、性质列、城市列、展位号等前缀。"""
     name = _UNIT_NOISE_RE.split(raw)[-1]
     # 引号/空格连写的口号尾巴取最后一段（"'拓'路同行 '荆'彩未来 拓荆科技"）
     name = re.split(r"[“”\"'‘’\s]+", name)[-1].strip("（）()、，,· ")
     name = re.sub(r"^[^\u4e00-\u9fff]+", "", name)  # 去掉前导数字/字母/符号（展位号等）
+    # 城市列（"国有企业安徽合肥合肥乐凯…"）：剥掉性质词后按"是否像独立列"剥地域——
+    # 后面仍紧跟地名（安徽合肥|合肥乐凯）或是"市"字尾模式（深圳市腾讯，norm_key
+    # 同样会剥）才剥；"合肥晶合"这类城市属于注册名的不剥，保住展示名完整。
+    name = _strip_geo_column(_UNIT_NATURE_RE.sub("", name))
     return name
 
 

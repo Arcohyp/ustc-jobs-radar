@@ -27,8 +27,8 @@ from datetime import date
 from pathlib import Path
 
 from collect import (ARCHIVE_DETAIL_PATH, DIRECTION_KEYWORDS, JD_KEYWORDS,
-                     clean_html, extract_units, is_fair_theme, match_detail,
-                     match_row, match_unit, parse_hold_date)
+                     _CITIES, clean_html, extract_units, is_fair_theme,
+                     match_detail, match_row, match_unit, parse_hold_date)
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
@@ -37,6 +37,8 @@ OUT_PATH = DATA_DIR / "apply_mining.md"
 HTML_PATH = DATA_DIR / "apply_mining.html"
 TRACKING_PATH = DATA_DIR / "tracking.json"
 TAGS_PATH = DATA_DIR / "tags.json"
+# 网搜补全：会话内人工/搜索补的联系方式，生成时并入卡片（key 为企业归并键）
+ENRICHMENT_PATH = DATA_DIR / "enrichment.json"
 
 # 常见 TLD 白名单，避免把紧跟的中文/大写字母误吞进邮箱域名（如 xxx.comQ）
 EMAIL_RE = re.compile(
@@ -78,19 +80,6 @@ _CORP_SUFFIX_RE = re.compile(
 
 _DATE_PREFIX_RE = re.compile(r"^(\d{1,2}\s*月\s*\d{1,2}\s*日|(19|20)\d{2}\s*年)")
 
-# 前导/尾随地域词：只有剩余部分仍像企业名（长度够、不带机构简称）才剥，
-# 避免 "上海银行"->"银行"、"西安交通大学"->"交通大学" 这类误并
-# 地域词（前后中间都可能出现："深圳埃芯半导体"、"国仪量子（合肥）技术"）：
-# 只有整体够长、剩余仍像企业名且不带机构简称时才剥，防止
-# "上海银行"->"银行"、"西安交通大学"->"交通大学" 这类误并
-_CITIES = ("北京", "上海", "天津", "重庆", "广州", "深圳", "杭州", "南京", "苏州",
-           "无锡", "合肥", "成都", "武汉", "西安", "长沙", "郑州", "宁波", "厦门",
-           "青岛", "济南", "烟台", "常州", "温州", "东莞", "佛山", "珠海", "三亚",
-           "大连", "沈阳", "长春", "哈尔滨", "石家庄", "太原", "兰州", "南昌",
-           "昆明", "贵阳", "南宁", "福州", "海口", "江苏", "浙江", "安徽", "广东",
-           "山东", "四川", "湖南", "湖北", "福建", "陕西", "河南", "河北", "江西",
-           "辽宁", "吉林", "黑龙江", "内蒙古", "广西", "云南", "贵州", "海南",
-           "甘肃", "山西")
 _ORG_GUARD = ("大学", "学院", "中学", "学校", "医院", "银行", "研究院", "研究所")
 
 # ---- base 地识别：JD 里"工作地点/base"锚点附近的城市权重高，全文散提权重低 ----
@@ -219,6 +208,8 @@ def _infer_name(theme: str) -> str:
     t = theme.strip()
     for _ in range(2):
         t = re.sub(r"^【[^】]*】[：:]?\s*", "", t)               # 【上市国企】类标签
+    t = re.sub(r"^(国有企业|上市公司|央企|民企|外企|事业单位|科研院所)[·\s]?",
+               "", t)  # 无括号的企业性质前缀："国有企业江苏无锡京东方…"
     t = re.sub(r"^[“\"'‘][^”\"'’]*[”\"'’]\s*", "", t)         # 引号口号前缀
     t = re.sub(r"^\d{1,2}\s*月\s*\d{1,2}\s*日[，,]?\s*", "", t)  # 3月27日
     t = re.sub(r"^(19|20)\d{2}\s*年\s*", "", t)                # 2026年
@@ -471,6 +462,29 @@ def main():
     for (tier, title), (_, items) in zip(TIER_TITLES, groups):
         add_rows(items, title)
     add_rows(soe, SOE_SECTION)
+
+    # ---- 网搜补全：并入人工搜索补到的联系方式/核验结论 ----
+    enrichment = (json.loads(ENRICHMENT_PATH.read_text(encoding="utf-8"))
+                  if ENRICHMENT_PATH.exists() else {})
+    n_enriched = 0
+    for row in rows:
+        e = enrichment.get(row["key"])
+        if not e:
+            continue
+        n_enriched += 1
+        for u in e.get("urls", []):
+            if u not in row["urls"]:
+                row["urls"].append(u)
+        row["emails"] = sorted(set(row["emails"]) | set(e.get("emails", [])))
+        mark = f"网搜补全 {e.get('date', '')}".strip()
+        if e.get("note"):
+            mark += "：" + e["note"]
+        if mark not in row["note"]:
+            row["note"] += (" ｜ " if row["note"] else "") + mark
+        if e.get("not_employer"):
+            row["tags"].append("⚠️疑似非招聘主体")
+    if n_enriched:
+        print(f"并入网搜补全 {n_enriched} 家")
 
     # ---- 旧键迁移：老版本页面用展示名做键，企业卡归并后键是归一化名 ----
     row_keys = {r["key"] for r in rows}
