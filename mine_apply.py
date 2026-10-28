@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""从归档场次挖掘"仍可投递"的公司名单（纯离线，不访问网络）。
+"""从归档场次挖掘"仍可投递"的企业名单（纯离线，不访问网络）。
 
 思路：宣讲会过期≠投递渠道关闭。归档里的 JD 正文（archive_details.jsonl）
 保留了投递邮箱、网申链接等文本信息，本脚本：
 
-    1. 对全部归档场次跑画像匹配（标题四档 + JD 关键词兜底，规则与 collect.py 一致）
-    2. 对命中的场次从 JD 正文提取邮箱、外链、投递提示原句
-    3. 按公司去重（同公司多场宣讲合并为一条，以来校最晚的一场为准）
-    4. 输出 data/apply_mining.md，按档位分组，附时效提醒
+    1. 对全部归档场次跑画像匹配（标题四档 + JD 关键词兜底，规则与 collect.py 一致），
+       并展开组团招聘会的参会单位（extract_units / match_unit）
+    2. 企业为主键归并：同企业无论几场宣讲、单独办会还是团招参展，合并为一张企业卡；
+       按归一化名称（去公司后缀/标点/大小写）判同，自动别名合并
+    3. 从 JD 提取邮箱、外链、投递提示，并打自动标签（命中的方向/强关键词、国企）
+    4. 输出：
+       - data/apply_mining.md（文本版，供 grep）
+       - data/apply_mining.html（交互版：状态标记、标签增删、搜索、JD 全文检索——
+         后者需 track_server.py 提供 /api/search）
 
 注意：JD 是历史文本，提取的邮箱/链接可能已过期；二维码和图片海报
-在抓取时未保留。建议拿公司名去搜当年校招入口确认。
+在抓取时未保留。建议拿企业名去搜当年校招入口确认。
 
 用法：
-    python3 mine_apply.py            # 全量挖掘，生成 data/apply_mining.md + apply_mining.html
-                                     # （.html 为交互版：浏览器打开可逐家标记投递状态）
+    python3 mine_apply.py
 """
 
 import json
@@ -22,9 +26,9 @@ import re
 from datetime import date
 from pathlib import Path
 
-from collect import (ARCHIVE_DETAIL_PATH, clean_html, extract_units,
-                     is_fair_theme, match_detail, match_row, match_unit,
-                     parse_hold_date)
+from collect import (ARCHIVE_DETAIL_PATH, DIRECTION_KEYWORDS, JD_KEYWORDS,
+                     clean_html, extract_units, is_fair_theme, match_detail,
+                     match_row, match_unit, parse_hold_date)
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
@@ -32,6 +36,7 @@ ARCHIVE_PATH = DATA_DIR / "archive.jsonl"
 OUT_PATH = DATA_DIR / "apply_mining.md"
 HTML_PATH = DATA_DIR / "apply_mining.html"
 TRACKING_PATH = DATA_DIR / "tracking.json"
+TAGS_PATH = DATA_DIR / "tags.json"
 
 # 常见 TLD 白名单，避免把紧跟的中文/大写字母误吞进邮箱域名（如 xxx.comQ）
 EMAIL_RE = re.compile(
@@ -42,7 +47,7 @@ URL_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#@!$&*+,;=%]+")
 SNIP_RE = re.compile(r"网申|投递|简历|报名|申请|邮箱|career|campus", re.I)
 DROP_URL_HINTS = ("ustc.edu.cn", "ahbys.com")  # 校内的信息页/源站链接，非投递渠道
 
-# 与 matches.md 一致的分档与顺序
+# 分档与优先级（数字越小越靠前）
 TIER_TITLES = [
     ("target", "🎯 目标企业（投递清单内）"),
     ("worth", "🔎 值得一看（方向高度相关）"),
@@ -50,11 +55,11 @@ TIER_TITLES = [
     ("direction_jd", "🔍 JD 方向相关（宽松命中）"),
     ("direction", "🔍 方向相关（兜底关键词）"),
 ]
+TIER_RANK = {tier: i for i, (tier, _) in enumerate(TIER_TITLES)}
 SOE_SECTION = "⚠️ 匹配但疑似国企/央企属性"
-FAIR_SECTION = "🏢 组团招聘会内匹配的参会单位"
 
 # 投递状态分类（单选）。key 存进 tracking.json / localStorage，
-# 以公司名为键，重生成报告不丢；新公司默认未处理。
+# 以企业名为键，重生成报告不丢；新企业默认未处理。
 STATUSES = [
     ("", "⬜ 未处理"),
     ("interested", "⭐ 有意向"),
@@ -67,27 +72,18 @@ STATUSES = [
 ]
 EXCLUDED_STATUSES = {"rejected", "failed"}
 
-
-def esc(s: str) -> str:
-    """HTML 转义（数据来自抓取文本，防注入）。"""
-    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-             .replace('"', "&quot;").replace("'", "&#39;"))
+_CORP_SUFFIX_RE = re.compile(
+    r"(股份有限公司|有限责任公司|集团有限公司|集团股份有限公司|有限公司|集团)$")
 
 
-def render_html(sections: list[str], rows: list[dict], tracking: dict) -> str:
-    """生成交互式单文件 HTML：状态标记存 localStorage，可导出/导入 JSON。"""
-    dumps = lambda obj: json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
-    page = HTML_TEMPLATE
-    for placeholder, value in [
-        ("__DATE__", str(date.today())),
-        ("__SECTIONS__", dumps(sections)),
-        ("__ROWS__", dumps(rows)),
-        ("__STATUSES__", dumps(STATUSES)),
-        ("__EMBEDDED__", dumps(tracking)),
-        ("__EXCLUDED__", dumps(sorted(EXCLUDED_STATUSES))),
-    ]:
-        page = page.replace(placeholder, value)
-    return page
+def norm_key(name: str) -> str:
+    """归一化企业名用于判同：去公司后缀、标点、空白，忽略大小写。
+
+    "长鑫科技集团股份有限公司"、"长鑫科技"、"长鑫科技集团" -> 同一归并键。
+    注意可能误并名字相近的不同企业（少见），宁可少拆不可多拆的原则下可接受。"""
+    n = _CORP_SUFFIX_RE.sub("", name.strip())
+    n = re.sub(r"[\s\"'“”‘’（）()·、,，.。]", "", n)
+    return n.lower()
 
 
 def extract_contacts(text: str) -> tuple[list[str], list[str], str]:
@@ -108,14 +104,247 @@ def extract_contacts(text: str) -> tuple[list[str], list[str], str]:
     return emails, urls, snippet
 
 
-def company_key(tier: str, name: str | None, theme: str) -> str:
-    """去重键：目标/值得一看档用匹配到的公司名，其余档用主题（近似公司）。"""
+def company_display_name(name: str | None, theme: str) -> str:
+    """展示名：画像匹配名优先，否则从宣讲主题推断。"""
     if name:
         return name
-    return re.sub(r"(20\d\d.*?(招聘|校招|秋招|春招|宣讲会).*|宣讲会.*)$", "", theme).strip() or theme
+    return (re.sub(r"(20\d\d.*?(招聘|校招|秋招|春招|宣讲会).*|宣讲会.*)$", "", theme)
+            .strip() or theme)
 
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+def add_company(companies: dict, nkey: str, display: str, tier: str,
+                is_soe: bool, session: dict) -> dict:
+    """按归并键 upsert 企业卡：场次进列表，档位取最高优先级。"""
+    c = companies.get(nkey)
+    if c is None:
+        c = companies[nkey] = {
+            "nkey": nkey, "names": set(), "tier": tier, "is_soe": is_soe,
+            "sessions": [], "emails": set(), "urls": set(), "tags": set(),
+            "latest": None,
+        }
+    c["names"].add(display)
+    if TIER_RANK.get(tier, 99) < TIER_RANK.get(c["tier"], 99):
+        c["tier"] = tier
+    c["is_soe"] = c["is_soe"] or is_soe
+    c["sessions"].append(session)
+    d = session.get("hold_date")
+    if d and (c["latest"] is None or d > c["latest"]):
+        c["latest"] = d
+    c["emails"] |= set(session.get("emails", []))
+    c["urls"] |= set(session.get("urls", []))
+    c["tags"] |= set(session.get("tags", []))
+    return c
+
+
+def render_html(sections: list[str], rows: list[dict], tracking: dict,
+                user_tags: dict, row_keys: list[str]) -> str:
+    """生成交互式单文件 HTML。"""
+    dumps = lambda obj: json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+    page = HTML_TEMPLATE
+    for placeholder, value in [
+        ("__DATE__", str(date.today())),
+        ("__SECTIONS__", dumps(sections)),
+        ("__ROWS__", dumps(rows)),
+        ("__STATUSES__", dumps(STATUSES)),
+        ("__EXCLUDED__", dumps(sorted(EXCLUDED_STATUSES))),
+        ("__EMBEDDED_TRACKING__", dumps(tracking)),
+        ("__EMBEDDED_TAGS__", dumps(user_tags)),
+        ("__ROWKEYS__", dumps(row_keys)),
+    ]:
+        page = page.replace(placeholder, value)
+    return page
+
+
+def main():
+    from collect import load_jsonl_by_id  # 延迟导入，复用按 ID 读取
+    archived = load_jsonl_by_id(ARCHIVE_PATH)
+    details = load_jsonl_by_id(ARCHIVE_DETAIL_PATH)
+
+    companies: dict[str, dict] = {}
+
+    # ---- 专场宣讲：画像匹配 + 联系方式 + 自动标签 ----
+    n_matched = 0
+    for r in archived.values():
+        tier, name, note, is_soe = match_row(r)
+        if not tier:
+            tier, note = match_detail(r, details)
+        if not tier:
+            continue
+        n_matched += 1
+        d = details.get(r["ID"], {})
+        text = d.get("DescriptionText", "")
+        emails, urls, snippet = extract_contacts(text)
+        title = r.get("Theme", "")
+        # 自动标签：标题/JD 命中的关键词
+        tags = {k for k in DIRECTION_KEYWORDS if k in title}
+        tags |= {k for k in JD_KEYWORDS if k in text}
+        tags |= {k for k in DIRECTION_KEYWORDS if k in text}
+        if is_soe:
+            tags.add("国企")
+        hd = parse_hold_date(r)
+        display = company_display_name(name, title)
+        add_company(companies, norm_key(display), display, tier, is_soe, {
+            "iid": r["ID"], "theme": title,
+            "hold": r.get("HoldDateTxt", "").replace("&nbsp;", " ").strip(),
+            "hold_date": str(hd) if hd else "",
+            "url": f"https://job.ustc.edu.cn/Specialrecruitment/info.aspx?itemid={r['ID']}",
+            "src": "专场宣讲", "note": note, "snippet": snippet,
+            "emails": emails, "urls": urls, "tags": sorted(tags),
+        })
+    print(f"专场命中 {n_matched} 场，归并后 {len(companies)} 家企业")
+
+    # ---- 组团招聘会：展开参会单位，并入同一张企业卡 ----
+    n_units = 0
+    for r in archived.values():
+        if not is_fair_theme(r.get("Theme", "")):
+            continue
+        d = details.get(r["ID"], {})
+        text = d.get("DescriptionText", "")
+        for uname, ctx in extract_units(text):
+            tier, note, is_soe = match_unit(uname, ctx)
+            if not tier:
+                continue
+            n_units += 1
+            emails, urls, snippet = extract_contacts(ctx)
+            tags = {k for k in JD_KEYWORDS if k in ctx}
+            tags |= {k for k in DIRECTION_KEYWORDS if k in ctx}
+            if is_soe:
+                tags.add("国企")
+            hd = parse_hold_date(r)
+            add_company(companies, norm_key(uname), uname, tier, is_soe, {
+                "iid": r["ID"], "theme": r.get("Theme", ""),
+                "hold": r.get("HoldDateTxt", "").replace("&nbsp;", " ").strip(),
+                "hold_date": str(hd) if hd else "",
+                "url": f"https://job.ustc.edu.cn/Specialrecruitment/info.aspx?itemid={r['ID']}",
+                "src": f"团招·{uname}", "note": note, "snippet": snippet,
+                "emails": emails, "urls": urls, "tags": sorted(tags),
+            })
+    print(f"团招单位命中 {n_units} 家，归并后共 {len(companies)} 家企业")
+
+    # ---- 展示名：优先画像匹配到的官方名/全名（最长别名）----
+    for c in companies.values():
+        c["name"] = max(c["names"], key=len)
+
+    # ---- 分组排序 ----
+    def in_tier(tier: str) -> list[dict]:
+        items = [c for c in companies.values()
+                 if c["tier"] == tier and not c["is_soe"]]
+        items.sort(key=lambda c: c["latest"] or date.min, reverse=True)
+        return items
+
+    groups = [(title, in_tier(tier)) for tier, title in TIER_TITLES]
+    soe = sorted((c for c in companies.values() if c["is_soe"]),
+                 key=lambda c: c["latest"] or date.min, reverse=True)
+
+    # ---- 文本版 md ----
+    md = [f"# 归档挖掘：可回捞投递的企业名单（生成于 {date.today()}）",
+          "",
+          f"数据来源：{len(archived)} 场过期宣讲会归档，专场命中 {n_matched} 场、"
+          f"团招单位 {n_units} 家，归并后 {len(companies)} 家企业（企业为主键）。",
+          "",
+          "> ⚠️ 时效提醒：JD 为历史文本，下列邮箱/链接可能已失效；"
+          "二维码与图片海报未保留。建议以企业名为准搜索当年校招入口确认投递状态。",
+          "",
+          "交互版（状态标记/标签/搜索/JD 全文检索）：`data/apply_mining.html`",
+          ""]
+
+    def row_line(c: dict) -> str:
+        cell = lambda s: str(s).replace("|", "｜")
+        sess = sorted(c["sessions"],
+                      key=lambda s: s["hold_date"], reverse=True)
+        s0 = sess[0]
+        emails = "、".join(sorted(c["emails"])) or "—"
+        urls = "<br>".join(sorted(c["urls"])[:3]) or "—"
+        snip = cell(s0["snippet"]) if s0["snippet"] else "—"
+        more = f"（共 {len(sess)} 场）" if len(sess) > 1 else ""
+        return (f"| {cell(s0['theme'])} | {cell(s0['hold'] or '—')}{more} "
+                f"| {cell(emails)} | {cell(urls)} | {snip} |")
+
+    for title, items in groups:
+        if not items:
+            continue
+        md.append(f"\n## {title}（{len(items)} 家）\n")
+        md.append("| 宣讲会主题 | 上次来校 | 投递邮箱 | 网申/链接 | JD 投递提示 |")
+        md.append("|---|---|---|---|---|")
+        md.extend(row_line(c) for c in items)
+    if soe:
+        md.append(f"\n## {SOE_SECTION}（{len(soe)} 家）\n")
+        md.append("| 宣讲会主题 | 上次来校 | 投递邮箱 | 网申/链接 | JD 投递提示 |")
+        md.append("|---|---|---|---|---|")
+        md.extend(row_line(c) for c in soe)
+
+    OUT_PATH.write_text("\n".join(md) + "\n", encoding="utf-8")
+    print(f"已保存：{OUT_PATH}")
+
+    # ---- 交互版 HTML ----
+    tracking = (json.loads(TRACKING_PATH.read_text(encoding="utf-8"))
+                if TRACKING_PATH.exists() else {})
+    user_tags = (json.loads(TAGS_PATH.read_text(encoding="utf-8"))
+                 if TAGS_PATH.exists() else {})
+
+    sections: list[str] = []
+    rows: list[dict] = []
+
+    def add_rows(items: list[dict], section: str) -> None:
+        if not items:
+            return
+        if section not in sections:
+            sections.append(section)
+        for c in items:
+            sess = sorted(c["sessions"],
+                          key=lambda s: s["hold_date"], reverse=True)
+            rows.append({
+                "key": c["nkey"],
+                "name": c["name"],
+                "section": section,
+                "note": sess[0]["note"],
+                "tags": sorted(c["tags"]),
+                "emails": sorted(c["emails"]),
+                "urls": sorted(c["urls"])[:4],
+                "latest": str(c["latest"]) if c["latest"] else "",
+                "n_sessions": len(sess),
+                "sessions": [{
+                    "iid": s["iid"], "theme": s["theme"], "hold": s["hold"],
+                    "url": s["url"], "src": s["src"],
+                    "snippet": s["snippet"][:120],
+                } for s in sess],
+            })
+
+    for (tier, title), (_, items) in zip(TIER_TITLES, groups):
+        add_rows(items, title)
+    add_rows(soe, SOE_SECTION)
+
+    # ---- 旧键迁移：老版本页面用展示名做键，企业卡归并后键是归一化名 ----
+    row_keys = {r["key"] for r in rows}
+
+    def _migrate_keys(d: dict) -> tuple[dict, bool]:
+        out, changed = {}, False
+        for k, v in d.items():
+            nk = k if k in row_keys else norm_key(k)
+            if nk not in row_keys:
+                nk = k  # 已下架企业：保留原键
+            changed |= nk != k
+            out[nk] = v
+        return out, changed
+
+    tracking, ch_t = _migrate_keys(tracking)
+    user_tags, ch_u = _migrate_keys(user_tags)
+    for path, data, changed in ((TRACKING_PATH, tracking, ch_t),
+                                (TAGS_PATH, user_tags, ch_u)):
+        if changed:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(path)
+            print(f"已迁移旧键：{path.name}")
+
+    HTML_PATH.write_text(
+        render_html(sections, rows, tracking, user_tags, sorted(row_keys)),
+        encoding="utf-8")
+    print(f"已保存：{HTML_PATH}（{len(rows)} 家企业）")
+
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -125,33 +354,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;color:#222;background:#fafafa}
 h1{font-size:22px}
 h2{font-size:16px;margin:26px 0 10px;border-left:4px solid #4a7dff;padding-left:8px}
-.toolbar{position:sticky;top:0;background:#fff;padding:10px 4px;border-bottom:1px solid #eee;display:flex;gap:14px;align-items:center;flex-wrap:wrap;z-index:9;font-size:13px}
 button{padding:4px 12px;border:1px solid #ccc;background:#fff;border-radius:6px;cursor:pointer;font-size:13px}
 .chip{border:1px solid #ccc;border-radius:12px;padding:2px 10px;font-size:12px;background:#fff;cursor:pointer}
 .chip.on{background:#4a7dff;color:#fff;border-color:#4a7dff}
+.chip.tag.on{background:#2f9e44;border-color:#2f9e44}
+.toolbar{position:sticky;top:0;background:#fff;padding:10px 4px;border-bottom:1px solid #eee;z-index:9;font-size:13px}
+.toolbar .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0}
+#search{flex:1;min-width:200px;padding:6px 10px;border:1px solid #ccc;border-radius:6px;font-size:14px}
 .card{background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:10px 12px;margin:8px 0;display:flex;gap:12px;align-items:flex-start}
 .card.excluded{opacity:.4}
 .main{flex:1;min-width:0}
 .name{font-weight:600}
 .meta{color:#888;font-size:12px;margin:3px 0}
 .snip{color:#555;font-size:13px;margin-top:3px}
-.tags span{background:#eef3ff;border-radius:4px;padding:1px 6px;margin-right:6px;font-size:12px}
+.tag{display:inline-block;background:#eef3ff;border-radius:4px;padding:1px 6px;margin:2px 4px 2px 0;font-size:12px}
+.tag.utag{background:#e7f5ec;color:#2b8a3e;cursor:pointer}
 a{color:#4a7dff;word-break:break-all;font-size:13px}
 select{flex-shrink:0;font-size:13px;padding:3px}
+details{margin-top:6px;font-size:13px}
+summary{cursor:pointer;color:#666}
+.sess{padding:4px 0;border-top:1px dashed #eee}
+.tagadd{font-size:12px;padding:2px 6px;width:110px;border:1px solid #ddd;border-radius:4px}
 </style>
 </head>
 <body>
 <h1>USTC 可回捞投递名单 <small style="color:#888;font-weight:normal">生成于 __DATE__</small></h1>
 <div class="toolbar">
-  <strong id="stats"></strong>
-  <span id="filters" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"></span>
-  <button onclick="selectAllStatuses()">全选</button>
-  <button onclick="resetFilter()">重置</button>
-  <span style="display:flex;gap:10px;align-items:center">
+  <div class="row">
+    <strong id="stats"></strong>
+    <span style="flex:1"></span>
     <button onclick="exportJson()">备份导出</button>
     <label style="color:#666">恢复 <input type="file" accept=".json" onchange="importJson(event)"></label>
-  </span>
-  <span id="sync" style="color:#999;font-size:12px"></span>
+    <span id="sync" style="color:#999;font-size:12px"></span>
+  </div>
+  <div class="row">
+    <input id="search" placeholder="搜索企业名 / 宣讲主题 / 备注 / 标签；输入≥2字自动检索 JD 全文" oninput="onSearch(this.value)">
+    <span id="searchHint" style="color:#999;font-size:12px"></span>
+  </div>
+  <div class="row" id="statusFilters"></div>
+  <div class="row" id="tagFilters"></div>
 </div>
 <div id="app"></div>
 <script>
@@ -160,28 +401,53 @@ const ROWS = __ROWS__;
 const STATUSES = __STATUSES__;
 const EXCLUDED = new Set(__EXCLUDED__);
 const LS_KEY = "ustc-jobs-tracking-v1";
+const LS_TAGS = "ustc-jobs-utags-v1";
 const SERVER = location.protocol.startsWith("http");
 
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-// 初始状态：生成时嵌入的 data/tracking.json + 浏览器 localStorage 覆盖
-const lsCache = (() => { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch (e) { return {}; } })();
-let tracking = Object.assign({}, __EMBEDDED__, lsCache);
-// 默认筛选：除"不合适/已挂"外全选
-let selected = new Set(STATUSES.map(s => s[0]).filter(v => !EXCLUDED.has(v)));
+// ---- 状态（statuses）与用户标签（utags）：localStorage 起步，服务模式下以服务器为准 ----
+// 旧版本用展示名做键（如"京东集团"），企业卡归并后键为归一化名（如"京东"）：
+// 两边数据都在加载时按归一化规则重映射，旧键不会丢
+const ROWKEYS = new Set(__ROWKEYS__);
+function normKey(name) {
+  return String(name).trim()
+    .replace(/(股份有限公司|有限责任公司|集团有限公司|集团股份有限公司|有限公司|集团)$/, "")
+    .replace(/[\s"'“”‘’（）()·、,，.。]/g, "").toLowerCase();
+}
+function remapKeys(d) {
+  const out = {};
+  for (const [k, v] of Object.entries(d || {})) {
+    const nk = ROWKEYS.has(k) ? k : normKey(k);
+    out[ROWKEYS.has(nk) ? nk : k] = v;
+  }
+  return out;
+}
+const lsT = remapKeys((() => { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch (e) { return {}; } })());
+const lsU = remapKeys((() => { try { return JSON.parse(localStorage.getItem(LS_TAGS) || "{}"); } catch (e) { return {}; } })());
+let tracking = Object.assign({}, remapKeys(__EMBEDDED_TRACKING__), lsT);
+let utags = Object.assign({}, remapKeys(__EMBEDDED_TAGS__), lsU);
+
+let selectedStatuses = new Set(STATUSES.map(s => s[0]).filter(v => !EXCLUDED.has(v)));
+let selectedTags = new Set();
+let query = "";
+let jdHitKeys = new Set();   // JD 全文检索命中的企业键
 
 function statusOf(key) { return tracking[key] || ""; }
-function save() { localStorage.setItem(LS_KEY, JSON.stringify(tracking)); updateStats(); }
-
+function allTags(r) { return [...(r.tags || []), ...(utags[r.key] || [])]; }
+function save() {
+  localStorage.setItem(LS_KEY, JSON.stringify(tracking));
+  localStorage.setItem(LS_TAGS, JSON.stringify(utags));
+  updateStats();
+}
 function setSync(t) { const el = document.getElementById("sync"); if (el) el.textContent = t; }
-function postTracking(patch) {
+function postJSON(url, patch) {
   if (!SERVER) return Promise.resolve();
-  return fetch("/api/tracking", { method: "POST",
-    headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) })
+  return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) })
     .then(r => r.json())
     .then(() => setSync("已自动保存 " + new Date().toLocaleTimeString()))
-    .catch(() => setSync("⚠️ 自动保存失败：服务未响应，状态暂存浏览器"));
+    .catch(() => setSync("⚠️ 自动保存失败：服务未响应，改动暂存浏览器"));
 }
 
 function updateStats() {
@@ -189,6 +455,27 @@ function updateStats() {
   ROWS.forEach(r => { const s = statusOf(r.key); cnt[s] = (cnt[s] || 0) + 1; });
   const parts = STATUSES.filter(s => cnt[s[0]]).map(s => s[1] + " " + cnt[s[0]]);
   document.getElementById("stats").textContent = "共 " + ROWS.length + " 家 ｜ " + parts.join(" ｜ ");
+  // 标签 chips（带计数）
+  const tagCnt = {};
+  ROWS.forEach(r => allTags(r).forEach(t => tagCnt[t] = (tagCnt[t] || 0) + 1));
+  document.getElementById("tagFilters").innerHTML =
+    "<span style='color:#888'>标签：</span>" + Object.entries(tagCnt).sort((a, b) => b[1] - a[1]).map(([t, n]) =>
+    `<button class="chip tag${selectedTags.has(t) ? " on" : ""}" onclick="toggleTag('${esc(t)}')">${esc(t)} ${n}</button>`).join("");
+  document.getElementById("statusFilters").innerHTML =
+    "<span style='color:#888'>状态：</span>" + STATUSES.map(([v, l]) =>
+    `<button class="chip${selectedStatuses.has(v) ? " on" : ""}" onclick="toggleStatus('${v}')">${l}</button>`).join("");
+}
+
+function rowVisible(r) {
+  const st = statusOf(r.key);
+  if (!selectedStatuses.has(st)) return false;
+  if (selectedTags.size && !allTags(r).some(t => selectedTags.has(t))) return false;
+  if (query) {
+    const q = query.toLowerCase();
+    const inRow = (r.name + " " + r.note + " " + r.sessions.map(s => s.theme).join(" ") + " " + allTags(r).join(" ")).toLowerCase().includes(q);
+    if (!inRow && !jdHitKeys.has(r.key)) return false;
+  }
+  return true;
 }
 
 function rowHtml(r) {
@@ -197,51 +484,92 @@ function rowHtml(r) {
     `<option value="${v}"${v === st ? " selected" : ""}>${l}</option>`).join("");
   const emails = r.emails.length ? esc(r.emails.join("、")) : "—";
   const links = r.urls.map(u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`).join("<br>");
+  const tagsHtml = [
+    ...(r.tags || []).map(t => `<span class="tag">${esc(t)}</span>`),
+    ...(utags[r.key] || []).map(t => `<span class="tag utag" title="点击删除" onclick="removeUserTag('${esc(r.key)}','${esc(t)}')">${esc(t)} ✕</span>`),
+  ].join("");
+  const sessHtml = r.sessions.map(s =>
+    `<div class="sess">📅 ${esc(s.hold || "—")} ｜ <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.theme)}</a>`
+    + ` <span style="color:#999">[${esc(s.src)}]</span>`
+    + (s.snippet ? `<div class="snip">${esc(s.snippet)}</div>` : "") + `</div>`).join("");
   return `<div class="card${EXCLUDED.has(st) ? " excluded" : ""}" data-key="${esc(r.key)}">
     <select onchange="setStatus(this)">${opts}</select>
     <div class="main">
-      <div class="name">${esc(r.name)}</div>
-      <div class="meta">${esc(r.meta)}</div>
-      <div class="tags"><span>${esc(r.section)}</span>${r.note ? `<span>${esc(r.note)}</span>` : ""}</div>
+      <div class="name">${esc(r.name)}${r.n_sessions > 1 ? ` <span style="color:#999;font-size:12px">（共 ${r.n_sessions} 场）</span>` : ""}</div>
+      <div class="meta">${esc(r.latest)} ｜ ${esc(r.note)}</div>
+      <div>${tagsHtml}<input class="tagadd" placeholder="+回车加标签" onkeydown="addUserTag(event,'${esc(r.key)}')"></div>
       <div class="meta">邮箱：${emails}</div>
       ${links ? `<div>${links}</div>` : ""}
-      ${r.snippet ? `<div class="snip">${esc(r.snippet)}</div>` : ""}
+      ${r.sessions[0].snippet ? `<div class="snip">${esc(r.sessions[0].snippet)}</div>` : ""}
+      ${r.n_sessions > 1 ? `<details><summary>展开全部 ${r.n_sessions} 场宣讲</summary>${sessHtml}</details>`
+                         : sessHtml ? `<details><summary>本场详情</summary>${sessHtml}</details>` : ""}
     </div></div>`;
 }
 
 function render() {
   const app = document.getElementById("app");
   app.innerHTML = SECTIONS.map(sec => {
-    const rows = ROWS.filter(r => r.section === sec && selected.has(statusOf(r.key)));
+    const rows = ROWS.filter(r => r.section === sec && rowVisible(r));
     if (!rows.length) return "";
     return `<h2>${sec}（${rows.length}）</h2>` + rows.map(rowHtml).join("");
   }).join("");
 }
 
-function renderFilters() {
-  document.getElementById("filters").innerHTML = "筛选：" + STATUSES.map(([v, l]) =>
-    `<button class="chip${selected.has(v) ? " on" : ""}" onclick="toggleStatus('${v}')">${l}</button>`).join("");
-}
-function toggleStatus(v) { selected.has(v) ? selected.delete(v) : selected.add(v); renderFilters(); render(); }
-function selectAllStatuses() { selected = new Set(STATUSES.map(s => s[0])); renderFilters(); render(); }
-function resetFilter() {
-  selected = new Set(STATUSES.map(s => s[0]).filter(v => !EXCLUDED.has(v)));
-  renderFilters(); render();
-}
+function toggleStatus(v) { selectedStatuses.has(v) ? selectedStatuses.delete(v) : selectedStatuses.add(v); updateStats(); render(); }
+function toggleTag(t) { selectedTags.has(t) ? selectedTags.delete(t) : selectedTags.add(t); updateStats(); render(); }
 
 function setStatus(sel) {
   const key = sel.closest(".card").dataset.key;
   tracking[key] = sel.value;
-  save();
-  postTracking({ [key]: sel.value });
+  save(); postJSON("/api/tracking", { [key]: sel.value }); render();
+}
+
+function addUserTag(ev, key) {
+  if (ev.key !== "Enter") return;
+  const t = ev.target.value.trim();
+  if (!t) return;
+  const cur = new Set(utags[key] || []);
+  cur.add(t);
+  utags[key] = [...cur];
+  ev.target.value = "";
+  save(); postJSON("/api/tags", { [key]: utags[key] }); render();
+}
+function removeUserTag(key, t) {
+  utags[key] = (utags[key] || []).filter(x => x !== t);
+  if (!utags[key].length) delete utags[key];
+  save(); postJSON("/api/tags", { [key]: utags[key] || null }); render();
+}
+
+// ---- 搜索：本地即时过滤 + 服务端 JD 全文检索（防抖）----
+let searchTimer = null;
+function onSearch(v) {
+  query = v.trim();
   render();
+  clearTimeout(searchTimer);
+  const hint = document.getElementById("searchHint");
+  if (!SERVER || query.length < 2) { jdHitKeys = new Set(); hint.textContent = ""; render(); return; }
+  hint.textContent = "检索 JD 全文…";
+  searchTimer = setTimeout(() => {
+    fetch("/api/search?q=" + encodeURIComponent(query))
+      .then(r => r.json())
+      .then(d => {
+        // 服务端按场次 iid 返回命中；映射回企业键
+        const hitIds = new Set(d.results.map(x => x.iid));
+        jdHitKeys = new Set(ROWS.filter(r =>
+          r.sessions.some(s => hitIds.has(s.iid))
+        ).map(r => r.key));
+        hint.textContent = "JD 全文命中 " + jdHitKeys.size + " 家";
+        render();
+      })
+      .catch(() => { hint.textContent = "JD 检索不可用"; });
+  }, 250);
 }
 
 function exportJson() {
-  const blob = new Blob([JSON.stringify(tracking, null, 1)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify({ statuses: tracking, tags: utags }, null, 1)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = "tracking.json";
+  a.download = "tracking_backup.json";
   a.click();
   URL.revokeObjectURL(a.href);
 }
@@ -252,211 +580,41 @@ function importJson(ev) {
   const reader = new FileReader();
   reader.onload = () => {
     try {
-      Object.assign(tracking, JSON.parse(reader.result));
-      save(); postTracking(JSON.parse(reader.result)); render();
-      alert("导入成功");
+      const d = JSON.parse(reader.result);
+      Object.assign(tracking, remapKeys(d.statuses || d));   // 兼容旧的纯状态格式
+      Object.assign(utags, remapKeys(d.tags || {}));
+      save(); postJSON("/api/tracking", tracking); postJSON("/api/tags", utags);
+      render(); alert("导入成功");
     } catch (e) { alert("导入失败：不是合法 JSON"); }
   };
   reader.readAsText(f);
   ev.target.value = "";
 }
 
-save(); renderFilters(); render();
+save(); updateStats(); render();
 if (SERVER) {
   setSync("连接服务中…");
-  fetch("/api/tracking").then(r => r.json()).then(serverT => {
-    // 服务器为准；localStorage 里有而服务器没有的键视为旧数据，自动补传（迁移）
-    const missing = {};
-    for (const [k, v] of Object.entries(lsCache)) if (!(k in serverT)) missing[k] = v;
-    if (Object.keys(missing).length) postTracking(missing);
-    tracking = Object.assign({}, lsCache, serverT);
+  Promise.all([fetch("/api/tracking").then(r => r.json()),
+               fetch("/api/tags").then(r => r.json())]).then(([serverT, serverU]) => {
+    // 服务器为准；浏览器独有的键补传（迁移旧数据）
+    const missT = {}, missU = {};
+    for (const [k, v] of Object.entries(lsT)) if (!(k in serverT)) missT[k] = v;
+    for (const [k, v] of Object.entries(lsU)) if (!(k in serverU)) missU[k] = v;
+    const jobs = [];
+    if (Object.keys(missT).length) jobs.push(postJSON("/api/tracking", missT));
+    if (Object.keys(missU).length) jobs.push(postJSON("/api/tags", missU));
+    tracking = Object.assign({}, lsT, serverT);
+    utags = Object.assign({}, lsU, serverU);
     save(); render();
-    setSync(Object.keys(missing).length
-      ? "已迁移 " + Object.keys(missing).length + " 条旧状态，自动保存已开启"
-      : "自动保存已开启（改动即时写入 data/tracking.json）");
-  }).catch(() => setSync("⚠️ 服务不可用，状态只存浏览器"));
+    const n = Object.keys(missT).length + Object.keys(missU).length;
+    setSync(n ? "已迁移 " + n + " 条旧数据，自动保存已开启" : "自动保存已开启（改动即时落盘）");
+  }).catch(() => setSync("⚠️ 服务不可用，改动只存浏览器"));
 } else {
-  setSync("file:// 模式：状态只存浏览器，看页面请先运行 track_server.py");
+  setSync("file:// 模式：改动只存浏览器，看页面请先运行 track_server.py");
 }
 </script>
 </body></html>
 """
-
-
-def main():
-    from collect import load_jsonl_by_id  # 延迟导入，复用按 ID 读取
-    archived = load_jsonl_by_id(ARCHIVE_PATH)
-    details = load_jsonl_by_id(ARCHIVE_DETAIL_PATH)
-
-    # ---- 画像匹配（与 collect.py 同一套规则）----
-    hits = []
-    for r in archived.values():
-        tier, name, note, is_soe = match_row(r)
-        if not tier:
-            tier, note = match_detail(r, details)
-        if tier:
-            hits.append({"row": r, "tier": tier, "name": name,
-                         "note": note, "is_soe": is_soe})
-    print(f"归档 {len(archived)} 场，画像命中 {len(hits)} 场")
-
-    # ---- 提取联系方式，按公司合并 ----
-    companies: dict[str, dict] = {}
-    for h in hits:
-        r = h["row"]
-        key = company_key(h["tier"], h["name"], r.get("Theme", ""))
-        d = details.get(r["ID"], {})
-        text = d.get("DescriptionText", "")
-        emails, urls, snippet = extract_contacts(text)
-        c = companies.setdefault(key, {
-            "tier": h["tier"], "is_soe": h["is_soe"], "themes": set(),
-            "latest": None, "emails": set(), "urls": set(), "snippets": [],
-            "hold": "",
-        })
-        c["themes"].add(r.get("Theme", ""))
-        hd = parse_hold_date(r)
-        if hd and (c["latest"] is None or hd > c["latest"]):
-            c["latest"] = hd
-            c["hold"] = r.get("HoldDateTxt", "")
-            if snippet:
-                c["snippets"] = [snippet]
-        c["emails"] |= set(emails)
-        c["urls"] |= set(urls)
-        if snippet and len(c["snippets"]) < 2:
-            c["snippets"].append(snippet)
-
-    print(f"去重后 {len(companies)} 家公司")
-
-    # ---- 组团招聘会：展开归档场次的参会单位，按岗位上下文匹配 ----
-    fair_units: dict[str, dict] = {}
-    for r in archived.values():
-        if not is_fair_theme(r.get("Theme", "")):
-            continue
-        d = details.get(r["ID"], {})
-        for name, ctx in extract_units(d.get("DescriptionText", "")):
-            tier, note, is_soe = match_unit(name, ctx)
-            if not tier:
-                continue
-            hd = parse_hold_date(r)
-            u = fair_units.setdefault(name, {
-                "name": name, "themes": set(), "latest": None, "hold": "",
-                "note": note, "is_soe": is_soe, "ctx": ctx,
-            })
-            u["themes"].add(r.get("Theme", ""))
-            if hd and (u["latest"] is None or hd > u["latest"]):
-                u.update(latest=hd, hold=r.get("HoldDateTxt", ""),
-                         note=note, is_soe=is_soe, ctx=ctx)
-    print(f"团招参会单位命中 {len(fair_units)} 家")
-
-    # ---- 输出报告 ----
-    md = [f"# 归档挖掘：可回捞投递的公司名单（生成于 {date.today()}）",
-          "",
-          f"数据来源：{len(archived)} 场过期宣讲会归档，画像命中 {len(hits)} 场，"
-          f"去重后 {len(companies)} 家公司。",
-          "",
-          "> ⚠️ 时效提醒：JD 为历史文本，下列邮箱/链接可能已失效；"
-          "二维码与图片海报未保留。建议以公司名为准搜索当年校招入口确认投递状态。",
-          "",
-          "交互版（浏览器打开可逐家标记投递状态，自动隐藏不合适/已挂）："
-          "`data/apply_mining.html`",
-          ""]
-
-    def row_line(c: dict) -> str:
-        cell = lambda s: s.replace("|", "｜")
-        emails = "、".join(sorted(c["emails"])) or "—"
-        urls = "<br>".join(sorted(c["urls"])[:3]) or "—"
-        snip = cell(c["snippets"][0]) if c["snippets"] else "—"
-        theme = cell(sorted(c["themes"])[0])
-        return (f"| {theme} | {c['hold'] or '—'} | {cell(emails)} "
-                f"| {cell(urls)} | {snip} |")
-
-    for tier, title in TIER_TITLES:
-        items = [(k, c) for k, c in companies.items()
-                 if c["tier"] == tier and not c["is_soe"]]
-        if not items:
-            continue
-        items.sort(key=lambda kv: kv[1]["latest"] or date.min, reverse=True)
-        md.append(f"\n## {title}（{len(items)} 家）\n")
-        md.append("| 宣讲会主题 | 上次来校 | 投递邮箱 | 网申/链接 | JD 投递提示 |")
-        md.append("|---|---|---|---|---|")
-        md.extend(row_line(c) for _, c in items)
-
-    soe_items = [c for c in companies.values() if c["is_soe"]]
-    if soe_items:
-        soe_items.sort(key=lambda c: c["latest"] or date.min, reverse=True)
-        md.append(f"\n## ⚠️ 匹配但疑似国企/央企属性（{len(soe_items)} 家）\n")
-        md.append("| 宣讲会主题 | 上次来校 | 投递邮箱 | 网申/链接 | JD 投递提示 |")
-        md.append("|---|---|---|---|---|")
-        md.extend(row_line(c) for c in soe_items)
-
-    if fair_units:
-        items = sorted(fair_units.values(),
-                       key=lambda u: u["latest"] or date.min, reverse=True)
-        md.append(f"\n## 🏢 组团招聘会内匹配的参会单位（{len(items)} 家）\n")
-        md.append("| 参会单位 | 最近所属场次 | 时间 | 命中 | 岗位/专业片段 |")
-        md.append("|---|---|---|---|---|")
-        for u in items:
-            cell = lambda s: s.replace("|", "｜")
-            theme = cell(max(u["themes"], key=len))
-            snip = cell(clean_html(u["ctx"])[:70]) if u["ctx"] else "—"
-            note = ("⚠️国企 " if u["is_soe"] else "") + u["note"]
-            md.append(f"| {cell(u['name'])} | {theme} | {cell(u['hold'] or '—')} "
-                      f"| {cell(note)} | {snip} |")
-
-    OUT_PATH.write_text("\n".join(md) + "\n", encoding="utf-8")
-    print(f"已保存：{OUT_PATH}")
-
-    # ---- 交互版 HTML：与 md 相同的分组排序，每行可标记投递状态 ----
-    tracking = {}
-    if TRACKING_PATH.exists():
-        tracking = json.loads(TRACKING_PATH.read_text(encoding="utf-8"))
-    sections: list[str] = []
-    html_rows: list[dict] = []
-
-    def add_rows(items: list[dict], section: str, meta_of, snippet_of):
-        if not items:
-            return
-        if section not in sections:
-            sections.append(section)
-        for it in items:
-            html_rows.append({
-                "key": it["key"], "section": section, "name": it["name"],
-                "meta": meta_of(it), "note": it.get("note", ""),
-                "emails": sorted(it.get("emails", [])),
-                "urls": sorted(it.get("urls", []))[:3],
-                "snippet": snippet_of(it),
-            })
-
-    for tier, title in TIER_TITLES:
-        items = [{"key": k, "name": sorted(c["themes"])[0], "latest": c["latest"],
-                  "hold": c["hold"], "emails": c["emails"], "urls": c["urls"],
-                  "note": "", "snippets": c["snippets"]}
-                 for k, c in companies.items() if c["tier"] == tier and not c["is_soe"]]
-        items.sort(key=lambda it: it["latest"] or date.min, reverse=True)
-        add_rows(items, title,
-                 lambda it: f"上次来校 {it['hold'] or '—'}",
-                 lambda it: it["snippets"][0] if it["snippets"] else "")
-
-    soe = [{"key": k, "name": sorted(c["themes"])[0], "latest": c["latest"],
-            "hold": c["hold"], "emails": c["emails"], "urls": c["urls"],
-            "note": "", "snippets": c["snippets"]}
-           for k, c in companies.items() if c["is_soe"]]
-    soe.sort(key=lambda it: it["latest"] or date.min, reverse=True)
-    add_rows(soe, SOE_SECTION,
-             lambda it: f"上次来校 {it['hold'] or '—'}",
-             lambda it: it["snippets"][0] if it["snippets"] else "")
-
-    units = [{"key": u["name"], "name": u["name"], "latest": u["latest"],
-              "hold": u["hold"], "note": u["note"], "themes": u["themes"],
-              "ctx": u["ctx"], "emails": [], "urls": []}
-             for u in fair_units.values()]
-    units.sort(key=lambda it: it["latest"] or date.min, reverse=True)
-    add_rows(units, FAIR_SECTION,
-             lambda it: f"{max(it['themes'], key=len)} ｜ {it['hold'] or '—'}",
-             lambda it: clean_html(it["ctx"])[:100])
-
-    HTML_PATH.write_text(render_html(sections, html_rows, tracking),
-                         encoding="utf-8")
-    print(f"已保存：{HTML_PATH}（{len(html_rows)} 家，状态 {len(tracking)} 条）")
 
 
 if __name__ == "__main__":

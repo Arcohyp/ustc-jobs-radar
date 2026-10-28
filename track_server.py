@@ -9,8 +9,13 @@
 - GET  /api/tracking        -> data/tracking.json（不存在则返回 {}）
 - POST /api/tracking        -> 请求体 {"公司名": "状态", ...}，合并进 tracking.json
                                （以服务器文件为准；页面只补传服务器缺失的键）
+- GET  /api/tags            -> data/tags.json：{"企业键": ["用户标签", ...]}
+- POST /api/tags            -> {"企业键": ["标签", ...] 或 null}；null 删除该键
+- GET  /api/search?q=关键词  -> 在全部 JD 正文（details + archive_details）里做
+                               子串检索，返回 [{"iid", "theme", "hold"}, ...]
+                               （索引按文件 mtime+size 缓存，数据更新自动重建）
 
-页面在 http:// 下打开时自动走本服务：改动状态即时写入 data/tracking.json，
+页面在 http:// 下打开时自动走本服务：改动状态/标签即时写入 data/ 下的 JSON，
 无需任何手动导出；file:// 下打开则退化为 localStorage + 手动备份。
 """
 
@@ -18,11 +23,13 @@ import json
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
 PAGE = DATA_DIR / "apply_mining.html"
 TRACKING_PATH = DATA_DIR / "tracking.json"
+TAGS_PATH = DATA_DIR / "tags.json"
 PORT = 8123
 
 # 快速连点时多个 POST 可能并发到达，合并+写盘必须串行，否则读-改-写会互相覆盖
@@ -30,12 +37,99 @@ _write_lock = threading.Lock()
 
 
 def load_tracking() -> dict:
-    if not TRACKING_PATH.exists():
+    return _load_json(TRACKING_PATH)
+
+
+def load_tags() -> dict:
+    return _load_json(TAGS_PATH)
+
+
+def _load_json(path: Path) -> dict:
+    if not path.exists():
         return {}
     try:
-        return json.loads(TRACKING_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+def _merge_json(path: Path, patch: dict, allow_null: bool = False) -> int:
+    """合并补丁进 JSON 文件（绝对值语义：以最后写入为准），原子写盘，返回键总数。"""
+    with _write_lock:
+        data = _load_json(path)
+        for k, v in patch.items():
+            if v is None and allow_null:
+                data.pop(k, None)
+            else:
+                data[k] = v
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(path)
+        return len(data)
+
+
+# ---- JD 全文检索索引：按文件签名（mtime+size）缓存，数据更新自动重建 ----
+_search_cache: dict = {}
+
+
+def _read_jsonl_ids(path: Path) -> dict:
+    """jsonl -> {ID: row}（容忍坏行）。"""
+    out = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "ID" in r:
+            out[r["ID"]] = r
+    return out
+
+
+def _search_index() -> list:
+    detail_files = [DATA_DIR / "details.jsonl", DATA_DIR / "archive_details.jsonl"]
+    session_files = [DATA_DIR / "list_store.jsonl", DATA_DIR / "archive.jsonl"]
+    sig = tuple((p.name, p.stat().st_mtime, p.stat().st_size)
+                for p in detail_files + session_files if p.exists())
+    if _search_cache.get("sig") == sig:
+        return _search_cache["rows"]
+
+    sessions = {}
+    for p in session_files:
+        sessions.update(_read_jsonl_ids(p))
+    rows = []
+    for p in detail_files:
+        for iid, d in _read_jsonl_ids(p).items():
+            text = d.get("DescriptionText", "")
+            if not text:
+                continue
+            s = sessions.get(iid, {})
+            rows.append({
+                "iid": iid,
+                "theme": s.get("Theme", ""),
+                "hold": s.get("HoldDateTxt", "").replace("&nbsp;", " ").strip(),
+                "text": text.lower(),
+            })
+    _search_cache["sig"] = sig
+    _search_cache["rows"] = rows
+    return rows
+
+
+def search_jd(query: str, limit: int = 200) -> list:
+    q = query.strip().lower()
+    if not q:
+        return []
+    hits, seen = [], set()
+    for r in _search_index():
+        if r["iid"] in seen or q not in r["text"]:
+            continue
+        seen.add(r["iid"])
+        hits.append({"iid": r["iid"], "theme": r["theme"], "hold": r["hold"]})
+        if len(hits) >= limit:
+            break
+    return hits
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -54,6 +148,11 @@ class Handler(SimpleHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/api/tracking":
             self._send_json(load_tracking())
+        elif path == "/api/tags":
+            self._send_json(load_tags())
+        elif path == "/api/search":
+            q = unquote(parse_qs(urlparse(self.path).query).get("q", [""])[0])
+            self._send_json({"results": search_jd(q)})
         elif path in ("/", "/index.html"):
             if not PAGE.exists():
                 self._send_json({"error": f"{PAGE} 不存在，请先运行 mine_apply.py"}, 404)
@@ -65,7 +164,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
-        if path != "/api/tracking":
+        if path not in ("/api/tracking", "/api/tags"):
             self._send_json({"error": "not found"}, 404)
             return
         try:
@@ -76,14 +175,13 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             self._send_json({"error": "请求体须为 JSON 对象"}, 400)
             return
-        with _write_lock:
-            data = load_tracking()
-            data.update(patch)
-            tmp = TRACKING_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
-            tmp.replace(TRACKING_PATH)
-            count = len(data)
+        if path == "/api/tracking":
+            count = _merge_json(TRACKING_PATH, patch)
+        else:
+            # 标签的值是数组；null 表示删除该企业的全部用户标签
+            clean = {k: v for k, v in patch.items()
+                     if v is None or isinstance(v, list)}
+            count = _merge_json(TAGS_PATH, clean, allow_null=True)
         self._send_json({"ok": True, "count": count})
 
     def log_message(self, fmt: str, *args) -> None:
