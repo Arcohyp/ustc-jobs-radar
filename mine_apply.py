@@ -93,6 +93,68 @@ _CITIES = ("北京", "上海", "天津", "重庆", "广州", "深圳", "杭州",
            "甘肃", "山西")
 _ORG_GUARD = ("大学", "学院", "中学", "学校", "医院", "银行", "研究院", "研究所")
 
+# ---- base 地识别：JD 里"工作地点/base"锚点附近的城市权重高，全文散提权重低 ----
+_CITY_RE = re.compile("|".join(map(re.escape, sorted(_CITIES, key=len, reverse=True))))
+_LOC_ANCHOR_RE = re.compile(
+    r"(?:工作地[点址城]|工作城市|base地?|入职地|期望城市|所在城市|办公地[点址]|"
+    r"公司地址|单位地址|地\s*址)[：: ]*([^\n。；;]{2,60})")
+
+_REGION_MAP: dict[str, str] = {}
+for _cs, _rg in (
+    (("合肥", "安徽"), "合肥"),
+    (("上海", "江苏", "浙江", "南京", "苏州", "无锡", "常州", "温州", "杭州", "宁波"), "江浙沪"),
+    (("北京", "天津", "河北", "石家庄"), "京津冀"),
+    (("广东", "广州", "深圳", "东莞", "佛山", "珠海"), "珠三角"),
+    (("四川", "成都", "重庆"), "成渝"),
+):
+    for _c in _cs:
+        _REGION_MAP[_c] = _rg
+# 省级地名（用于展示去重：top3 里同区域已有具体城市时不再显示省份）
+_PROVINCES = frozenset(("江苏", "浙江", "安徽", "广东", "山东", "四川", "湖南", "湖北",
+                        "福建", "陕西", "河南", "河北", "江西", "辽宁", "吉林", "黑龙江",
+                        "内蒙古", "广西", "云南", "贵州", "海南", "甘肃", "山西"))
+REGIONS = ["合肥", "江浙沪", "京津冀", "珠三角", "成渝", "其他", "未识别"]
+
+
+def extract_cities(text: str) -> dict[str, int]:
+    """从 JD 正文提取城市提及权重：工作地点类锚点附近 ×3，全文提及 ×1。"""
+    if not text:
+        return {}
+    w: dict[str, int] = {}
+    for m in _LOC_ANCHOR_RE.finditer(text):
+        for c in _CITY_RE.findall(m.group(1)):
+            w[c] = w.get(c, 0) + 3
+    for c in set(_CITY_RE.findall(text)):
+        w[c] = w.get(c, 0) + 1
+    return w
+
+
+def card_locations(city_weights: dict[str, int], name: str) -> tuple[list[str], list[str]]:
+    """聚合各场权重 -> (展示城市 top3[合肥优先], 区域列表)。
+
+    无 JD 城市时退回公司名里的城市（"苏州镁伽…"->苏州）。展示城市与区域
+    严格对应：卡片上看到的城市都可按它的区域筛出来。"""
+    w = dict(city_weights)
+    if not w:
+        for c in set(_CITY_RE.findall(name)):
+            w[c] = 2
+    if not w:
+        return [], ["未识别"]
+    top = sorted(w, key=lambda c: (-w[c], c))[:3]
+    if "合肥" in w and "合肥" not in top:
+        top = ["合肥"] + top[:2]
+    # 同区域已有具体城市时不重复展示省份（"合肥 · 安徽" -> "合肥"）
+    top = [c for c in top
+           if c not in _PROVINCES
+           or not any(o != c and _REGION_MAP.get(o, "其他") == _REGION_MAP.get(c, "其他")
+                      for o in top)]
+    regions: list[str] = []
+    for c in top:
+        rg = _REGION_MAP.get(c, "其他")
+        if rg not in regions:
+            regions.append(rg)
+    return top, regions
+
 
 def _strip_regions(n: str) -> str:
     if len(n) < 6 or any(g in n for g in _ORG_GUARD):
@@ -226,6 +288,7 @@ def render_html(sections: list[str], rows: list[dict], tracking: dict,
         ("__SECTIONS__", dumps(sections)),
         ("__ROWS__", dumps(rows)),
         ("__STATUSES__", dumps(STATUSES)),
+        ("__REGIONS__", dumps(REGIONS)),
         ("__EXCLUDED__", dumps(sorted(EXCLUDED_STATUSES))),
         ("__EMBEDDED_TRACKING__", dumps(tracking)),
         ("__EMBEDDED_TAGS__", dumps(user_tags)),
@@ -279,6 +342,7 @@ def main():
             "hold_date": str(hd) if hd else "",
             "url": f"https://job.ustc.edu.cn/Specialrecruitment/info.aspx?itemid={r['ID']}",
             "src": "专场宣讲", "note": note, "snippet": snippet,
+            "cities": extract_cities(text),
             "emails": emails, "urls": urls, "tags": sorted(tags),
         })
     print(f"专场命中 {n_matched} 场，归并后 {len(companies)} 家企业")
@@ -303,6 +367,7 @@ def main():
                 "hold_date": str(hd) if hd else "",
                 "url": f"https://job.ustc.edu.cn/Specialrecruitment/info.aspx?itemid={r['ID']}",
                 "src": f"团招·{uname}", "note": note, "snippet": snippet,
+                "cities": extract_cities(ctx),
                 "emails": emails, "urls": urls, "tags": sorted(tags),
             })
     print(f"团招单位命中 {n_units} 家，归并后共 {len(companies)} 家企业")
@@ -379,12 +444,19 @@ def main():
         for c in items:
             sess = sorted(c["sessions"],
                           key=lambda s: s["hold_date"], reverse=True)
+            cw: dict[str, int] = {}
+            for s in sess:
+                for city, n in s.get("cities", {}).items():
+                    cw[city] = cw.get(city, 0) + n
+            cities, regions = card_locations(cw, c["name"])
             rows.append({
                 "key": c["nkey"],
                 "name": c["name"],
                 "section": section,
                 "note": sess[0]["note"],
                 "tags": sorted(c["tags"]),
+                "cities": cities,
+                "regions": regions,
                 "emails": sorted(c["emails"]),
                 "urls": sorted(c["urls"])[:4],
                 "latest": str(c["latest"]) if c["latest"] else "",
@@ -478,6 +550,7 @@ summary{cursor:pointer;color:#666}
     <span id="searchHint" style="color:#999;font-size:12px"></span>
   </div>
   <div class="row" id="statusFilters"></div>
+  <div class="row" id="regionFilters"></div>
   <div class="row" id="tagFilters"></div>
 </div>
 <div id="app"></div>
@@ -485,6 +558,7 @@ summary{cursor:pointer;color:#666}
 const SECTIONS = __SECTIONS__;
 const ROWS = __ROWS__;
 const STATUSES = __STATUSES__;
+const REGIONS = __REGIONS__;
 const EXCLUDED = new Set(__EXCLUDED__);
 const LS_KEY = "ustc-jobs-tracking-v1";
 const LS_TAGS = "ustc-jobs-utags-v1";
@@ -517,6 +591,7 @@ let utags = Object.assign({}, remapKeys(__EMBEDDED_TAGS__), lsU);
 
 let selectedStatuses = new Set(STATUSES.map(s => s[0]).filter(v => !EXCLUDED.has(v)));
 let selectedTags = new Set();
+let selectedRegions = new Set();  // 空 = 不按 base 区域筛选
 let query = "";
 let jdHitKeys = new Set();   // JD 全文检索命中的企业键
 
@@ -550,12 +625,19 @@ function updateStats() {
   document.getElementById("statusFilters").innerHTML =
     "<span style='color:#888'>状态：</span>" + STATUSES.map(([v, l]) =>
     `<button class="chip${selectedStatuses.has(v) ? " on" : ""}" onclick="toggleStatus('${v}')">${l}</button>`).join("");
+  // base 区域 chips（带计数，固定顺序）
+  const rgCnt = {};
+  ROWS.forEach(r => (r.regions || []).forEach(g => rgCnt[g] = (rgCnt[g] || 0) + 1));
+  document.getElementById("regionFilters").innerHTML =
+    "<span style='color:#888'>base：</span>" + REGIONS.filter(g => rgCnt[g]).map(g =>
+    `<button class="chip${selectedRegions.has(g) ? " on" : ""}" onclick="toggleRegion('${g}')">${g} ${rgCnt[g]}</button>`).join("");
 }
 
 function rowVisible(r) {
   const st = statusOf(r.key);
   if (!selectedStatuses.has(st)) return false;
   if (selectedTags.size && !allTags(r).some(t => selectedTags.has(t))) return false;
+  if (selectedRegions.size && !(r.regions || []).some(g => selectedRegions.has(g))) return false;
   if (query) {
     const q = query.toLowerCase();
     const inRow = (r.name + " " + r.note + " " + r.sessions.map(s => s.theme).join(" ") + " " + allTags(r).join(" ")).toLowerCase().includes(q);
@@ -582,7 +664,7 @@ function rowHtml(r) {
     <select onchange="setStatus(this)">${opts}</select>
     <div class="main">
       <div class="name">${esc(r.name)}${r.n_sessions > 1 ? ` <span style="color:#999;font-size:12px">（共 ${r.n_sessions} 场）</span>` : ""}</div>
-      <div class="meta">${esc(r.latest)} ｜ ${esc(r.note)}</div>
+      <div class="meta">${r.cities && r.cities.length ? "📍" + esc(r.cities.join(" · ")) + " ｜ " : ""}${esc(r.latest)} ｜ ${esc(r.note)}</div>
       <div>${tagsHtml}<input class="tagadd" placeholder="+回车加标签" onkeydown="addUserTag(event,'${esc(r.key)}')"></div>
       <div class="meta">邮箱：${emails}</div>
       ${links ? `<div>${links}</div>` : ""}
@@ -603,6 +685,7 @@ function render() {
 
 function toggleStatus(v) { selectedStatuses.has(v) ? selectedStatuses.delete(v) : selectedStatuses.add(v); updateStats(); render(); }
 function toggleTag(t) { selectedTags.has(t) ? selectedTags.delete(t) : selectedTags.add(t); updateStats(); render(); }
+function toggleRegion(g) { selectedRegions.has(g) ? selectedRegions.delete(g) : selectedRegions.add(g); updateStats(); render(); }
 
 function setStatus(sel) {
   const key = sel.closest(".card").dataset.key;
