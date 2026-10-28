@@ -73,17 +73,60 @@ STATUSES = [
 EXCLUDED_STATUSES = {"rejected", "failed"}
 
 _CORP_SUFFIX_RE = re.compile(
-    r"(股份有限公司|有限责任公司|集团有限公司|集团股份有限公司|有限公司|集团)$")
+    r"(股份有限公司|有限责任公司|集团有限公司|集团股份有限公司|集成电路|"
+    r"机器人|半导体|微电子|集成|电子科技|信息|有限公司|集团|股份|公司|汽车|科技|技术)$")
+
+_DATE_PREFIX_RE = re.compile(r"^(\d{1,2}\s*月\s*\d{1,2}\s*日|(19|20)\d{2}\s*年)")
+
+# 前导/尾随地域词：只有剩余部分仍像企业名（长度够、不带机构简称）才剥，
+# 避免 "上海银行"->"银行"、"西安交通大学"->"交通大学" 这类误并
+# 地域词（前后中间都可能出现："深圳埃芯半导体"、"国仪量子（合肥）技术"）：
+# 只有整体够长、剩余仍像企业名且不带机构简称时才剥，防止
+# "上海银行"->"银行"、"西安交通大学"->"交通大学" 这类误并
+_CITIES = ("北京", "上海", "天津", "重庆", "广州", "深圳", "杭州", "南京", "苏州",
+           "无锡", "合肥", "成都", "武汉", "西安", "长沙", "郑州", "宁波", "厦门",
+           "青岛", "济南", "烟台", "常州", "温州", "东莞", "佛山", "珠海", "三亚",
+           "大连", "沈阳", "长春", "哈尔滨", "石家庄", "太原", "兰州", "南昌",
+           "昆明", "贵阳", "南宁", "福州", "海口", "江苏", "浙江", "安徽", "广东",
+           "山东", "四川", "湖南", "湖北", "福建", "陕西", "河南", "河北", "江西",
+           "辽宁", "吉林", "黑龙江", "内蒙古", "广西", "云南", "贵州", "海南",
+           "甘肃", "山西")
+_ORG_GUARD = ("大学", "学院", "中学", "学校", "医院", "银行", "研究院", "研究所")
+
+
+def _strip_regions(n: str) -> str:
+    if len(n) < 6 or any(g in n for g in _ORG_GUARD):
+        return n
+    n2 = n
+    for city in _CITIES:
+        n2 = n2.replace(city + "市", "").replace(city, "")
+    return n2 if len(n2) >= 4 else n
 
 
 def norm_key(name: str) -> str:
-    """归一化企业名用于判同：去公司后缀、标点、空白，忽略大小写。
+    """归一化企业名用于判同：去日期前缀、括号注释、公司后缀、地域词、
+    品牌字母前缀、标点，忽略大小写。
 
     "长鑫科技集团股份有限公司"、"长鑫科技"、"长鑫科技集团" -> 同一归并键。
     注意可能误并名字相近的不同企业（少见），宁可少拆不可多拆的原则下可接受。"""
-    n = _CORP_SUFFIX_RE.sub("", name.strip())
+    n = _DATE_PREFIX_RE.sub("", name.strip())
+    n = re.sub(r"[（(][^）)]*[）)]", "", n)  # 括号注释：东阳光集团（电子材料板块）
+    n = n.lower()
+    # 品牌字母前缀：AAC瑞声科技 -> 瑞声科技；剩余太短则保留（TCL实业 -> tcl实业）
+    m = re.match(r"^[a-z0-9]+", n)
+    if m and len(n) - m.end() >= 4:
+        n = n[m.end():]
+    # 地域与后缀交替剥到稳定（每轮地域先剥，再剥后缀）：
+    # 安徽江淮汽车集团 -> 江淮；深圳优艾智合机器人科技有限公司需 3 轮。
+    # 地域必须先于本轮后缀剥："江苏卓胜微电子" 若先剥微电子成 "江苏卓胜"(4 字)，
+    # 会触发 _strip_regions 长度守卫而漏剥省份，与全称归一化结果不一致。
+    for _ in range(5):
+        n2 = _CORP_SUFFIX_RE.sub("", _strip_regions(n))
+        if n2 == n:
+            break
+        n = n2
     n = re.sub(r"[\s\"'“”‘’（）()·、,，.。]", "", n)
-    return n.lower()
+    return n
 
 
 def extract_contacts(text: str) -> tuple[list[str], list[str], str]:
@@ -104,12 +147,49 @@ def extract_contacts(text: str) -> tuple[list[str], list[str], str]:
     return emails, urls, snippet
 
 
+def _infer_name(theme: str) -> str:
+    """从宣讲主题推断企业展示名：剥标签/引号口号/日期前缀/届数/招聘尾巴。
+
+    "3月27日杰瑞集团2026届春招空中宣讲会" -> "杰瑞集团"
+    ""汽梦同行，研创未来" 中国汽研" -> "中国汽研"
+    "AAC瑞声科技26届校园招聘线下" -> "AAC瑞声科技"
+    """
+    t = theme.strip()
+    for _ in range(2):
+        t = re.sub(r"^【[^】]*】[：:]?\s*", "", t)               # 【上市国企】类标签
+    t = re.sub(r"^[“\"'‘][^”\"'’]*[”\"'’]\s*", "", t)         # 引号口号前缀
+    t = re.sub(r"^\d{1,2}\s*月\s*\d{1,2}\s*日[，,]?\s*", "", t)  # 3月27日
+    t = re.sub(r"^(19|20)\d{2}\s*年\s*", "", t)                # 2026年
+    t = re.sub(r"^((19|20)\d{2}|\d{2})\s*届[，,]?\s*", "", t)   # 2026届 / 26届
+    # 尾切："…2026全球春季校园招聘"、"兆尹科技26春招"；\d{2} 前瞻带
+    # (?<![0-9A-Za-z])，避免 "360…校园招聘" 从数字中间切开
+    t = re.sub(r"((?<![0-9A-Za-z])((19|20)\d{2}|\d{2})"
+               r"(?=[\u4e00-\u9fff\s]{0,10}?(招聘|校招|秋招|春招|宣讲|找聘))"
+               r".*|(?<![0-9A-Za-z])((19|20)\d{2}|\d{2})\s*届.*|"
+               r"(秋季|春季|冬季|暑期|全球)?\s*(校园|空中|毕业生|应届)?\s*"
+               r"(招聘|校招|秋招|春招|找聘|宣讲会).*|专场.*|宣讲会.*)$", "", t)
+    # 口号与企业名连写（"汽梦同行，研创未来  中国汽研"）：取最后一段，
+    # 多轮处理 "生而不凡  敢为向上——TCL实业" 这类多重分隔
+    sep = r"[，,、·｜|丨—–\-]|\s{2,}|\u3000+"
+    for _ in range(3):
+        if re.search(sep, t):
+            t = re.split(sep, t)[-1]
+    # 口号与名单空格连写（"新央企 向新而行 长安汽车"）：单空格再取末词
+    if re.search(r"\s", t):
+        last = re.split(r"\s+", t)[-1]
+        if len(last) >= 4 and re.search(r"[一-龥]", last):
+            t = last
+    t = t.strip("“”\"'‘’【】 ，,、·|｜丨—–-　")
+    if not t:
+        # 剥完只剩招聘套话时（"【捷迅光电】2027届校园招聘宣讲会"），用标签内容兜底
+        m = re.search(r"【([^】]{2,20})】", theme)
+        t = (m.group(1).strip() if m else "") or theme
+    return t or theme
+
+
 def company_display_name(name: str | None, theme: str) -> str:
     """展示名：画像匹配名优先，否则从宣讲主题推断。"""
-    if name:
-        return name
-    return (re.sub(r"(20\d\d.*?(招聘|校招|秋招|春招|宣讲会).*|宣讲会.*)$", "", theme)
-            .strip() or theme)
+    return name if name else _infer_name(theme)
 
 
 def add_company(companies: dict, nkey: str, display: str, tier: str,
@@ -163,6 +243,14 @@ def main():
     companies: dict[str, dict] = {}
 
     # ---- 专场宣讲：画像匹配 + 联系方式 + 自动标签 ----
+    # 组团招聘会的 JD 是参会单位表，专场匹配只会命中"招聘会"本身产生噪音卡；
+    # 能展开出单位的团招直接跳过（单位卡已覆盖），展开不出单位的才保留专场卡
+    fair_units: dict[int, list] = {}
+    for r in archived.values():
+        if is_fair_theme(r.get("Theme", "")):
+            text = details.get(r["ID"], {}).get("DescriptionText", "")
+            fair_units[r["ID"]] = extract_units(text)
+
     n_matched = 0
     for r in archived.values():
         tier, name, note, is_soe = match_row(r)
@@ -170,11 +258,13 @@ def main():
             tier, note = match_detail(r, details)
         if not tier:
             continue
+        title = r.get("Theme", "")
+        if fair_units.get(r["ID"]):
+            continue
         n_matched += 1
         d = details.get(r["ID"], {})
         text = d.get("DescriptionText", "")
         emails, urls, snippet = extract_contacts(text)
-        title = r.get("Theme", "")
         # 自动标签：标题/JD 命中的关键词
         tags = {k for k in DIRECTION_KEYWORDS if k in title}
         tags |= {k for k in JD_KEYWORDS if k in text}
@@ -196,11 +286,7 @@ def main():
     # ---- 组团招聘会：展开参会单位，并入同一张企业卡 ----
     n_units = 0
     for r in archived.values():
-        if not is_fair_theme(r.get("Theme", "")):
-            continue
-        d = details.get(r["ID"], {})
-        text = d.get("DescriptionText", "")
-        for uname, ctx in extract_units(text):
+        for uname, ctx in fair_units.get(r["ID"], []):
             tier, note, is_soe = match_unit(uname, ctx)
             if not tier:
                 continue
@@ -221,9 +307,9 @@ def main():
             })
     print(f"团招单位命中 {n_units} 家，归并后共 {len(companies)} 家企业")
 
-    # ---- 展示名：优先画像匹配到的官方名/全名（最长别名）----
+    # ---- 展示名：取最短别名（不带日期/口号前缀的最干净形态）----
     for c in companies.values():
-        c["name"] = max(c["names"], key=len)
+        c["name"] = min(c["names"], key=lambda n: (len(n), n))
 
     # ---- 分组排序 ----
     def in_tier(tier: str) -> list[dict]:

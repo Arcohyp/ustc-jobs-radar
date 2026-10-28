@@ -226,26 +226,46 @@ def match_detail(row, details):
 
 
 # ---- 组团招聘会内参会单位展开 ----
-# 主题里出现这些词才展开（单公司宣讲会的 JD 不是单位表，展开无意义）
-FAIR_THEME_RE = re.compile(r"组团|双选|洽谈会|招聘会（|专场活动|人才周|校招平台")
+# 主题里出现这些词才展开（JD 是参会单位表而非单一公司简章）。
+# 注意：名单挖掘侧只有在真能展开出单位时才跳过专场卡，
+# 所以宁可宽匹配（单个公司主题的 JD 展开不出单位，自然退回专场处理）
+FAIR_THEME_RE = re.compile(
+    r"组团|双选|洽谈|招聘会|专场活动|人才周|校招平台|引才|招才|"
+    r"人才夜市|人才汇|英才汇|宣讲（")
 
 UNIT_SUFFIX_RE = re.compile(
     r"([\u4e00-\u9fffA-Za-z0-9（）()·]{2,26}?"
     r"(?:股份有限公司|有限责任公司|集团有限公司|有限公司|"
     r"研究院|研究所|设计院|重点实验室|实验室|创新中心|研发中心|技术中心|工程研究中心|"
-    r"大学|学院|医院|学校|银行|分行|集团|中心|分院|工作站|基地|园区|管委会|所|院|站|局))")
+    r"大学|学院|中学|小学|医院|学校|银行|分行|集团|中心|分院|工作站|基地|园区|管委会|所|院|站|局))")
+
+# 参会单位表被压成 "单位名 性质 城市 N 下一家单位名" 连写，行号 N 是唯一的
+# 行边界：中文字后紧跟 1-2 位数字、且数字后能在短距离内看到下一家单位的
+# 后缀锚点时，在数字处切开（数字本身丢弃）
+_ROW_IDX_RE = re.compile(
+    r"(?<=[\u4e00-\u9fff])\d{1,2}(?=(?:[\u4e00-\u9fff]{2,4})?"
+    r"[\u4e00-\u9fffA-Za-z0-9（）()·]{2,22}?"
+    r"(?:股份有限公司|有限责任公司|集团有限公司|有限公司|"
+    r"研究院|研究所|设计院|大学|学院|中学|小学|医院|学校|银行|分行|"
+    r"集团|中心|分院|工作站|基地|园区|管委会|所|院|站|局))")
 
 # 单位名里要剥掉的表头/岗位噪音词：连写文本里单位名前会粘着表头和岗位名，
 # 取最后一个噪音词之后的部分作为单位名
 _UNIT_NOISE_RE = re.compile(
-    r"单位名称|岗位名称|专业要求|招聘岗位|招聘单位|序号|"
+    r"单位名称|岗位名称|专业要求|招聘岗位|招聘单位|序号|届|"
+    r"公司简介|企业简介|企业介绍|公司介绍|"
     r"科技人才|青年人才|研发工程师|算法工程师|工程师|专员|主管|经理|"
     r"教师|医师|博士后|博士|硕士|科研人员|毕业生|岗位|名称|要求|详情|专业")
+
+# 正文散文句的特征词：单位名里出现这些说明锚点匹配到了 JD 介绍文字而非单位
+_UNIT_PROSE_MARKERS = ("交易所", "欢迎", "简介", "介绍", "投递", "招聘")
 
 
 def _clean_unit_name(raw: str) -> str:
     """剥掉连写文本里粘在单位名前的表头/岗位词、展位号等前缀。"""
-    name = _UNIT_NOISE_RE.split(raw)[-1].strip("（）()、，,· ")
+    name = _UNIT_NOISE_RE.split(raw)[-1]
+    # 引号/空格连写的口号尾巴取最后一段（"'拓'路同行 '荆'彩未来 拓荆科技"）
+    name = re.split(r"[“”\"'‘’\s]+", name)[-1].strip("（）()、，,· ")
     name = re.sub(r"^[^\u4e00-\u9fff]+", "", name)  # 去掉前导数字/字母/符号（展位号等）
     return name
 
@@ -262,15 +282,21 @@ def extract_units(text: str) -> list[tuple[str, str]]:
     岗位上下文，供关键词匹配。去重保序。"""
     if not text:
         return []
+    # 先在行号边界切开连写的单位表，再按后缀锚点提取单位
+    text = _ROW_IDX_RE.sub("\n", text)
     matches = list(UNIT_SUFFIX_RE.finditer(text))
     units = []
     for i, m in enumerate(matches):
         name = _clean_unit_name(m.group(1))
         if len(name) < 4 or len(name) > 30:
             continue
+        # 锚点可能切到 JD 介绍散文（"…在上海证券交易所"、"国仪量子欢迎所…"），拒收
+        if any(b in name for b in _UNIT_PROSE_MARKERS):
+            continue
         end = (matches[i + 1].start() if i + 1 < len(matches)
                else min(len(text), m.end() + 200))
-        units.append((name, text[m.end():end]))
+        ctx = text[m.end():end].split("\n")[0]  # 上下文只取本行，不带下一家单位
+        units.append((name, ctx))
     seen, out = set(), []
     for name, ctx in units:
         if name not in seen:
