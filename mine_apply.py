@@ -127,6 +127,8 @@ h1{font-size:22px}
 h2{font-size:16px;margin:26px 0 10px;border-left:4px solid #4a7dff;padding-left:8px}
 .toolbar{position:sticky;top:0;background:#fff;padding:10px 4px;border-bottom:1px solid #eee;display:flex;gap:14px;align-items:center;flex-wrap:wrap;z-index:9;font-size:13px}
 button{padding:4px 12px;border:1px solid #ccc;background:#fff;border-radius:6px;cursor:pointer;font-size:13px}
+.chip{border:1px solid #ccc;border-radius:12px;padding:2px 10px;font-size:12px;background:#fff;cursor:pointer}
+.chip.on{background:#4a7dff;color:#fff;border-color:#4a7dff}
 .card{background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:10px 12px;margin:8px 0;display:flex;gap:12px;align-items:flex-start}
 .card.excluded{opacity:.4}
 .main{flex:1;min-width:0}
@@ -142,10 +144,14 @@ select{flex-shrink:0;font-size:13px;padding:3px}
 <h1>USTC 可回捞投递名单 <small style="color:#888;font-weight:normal">生成于 __DATE__</small></h1>
 <div class="toolbar">
   <strong id="stats"></strong>
-  <button onclick="toggleExcluded()" id="btn-excluded">显示已排除（🚫/❌）</button>
-  <button onclick="exportJson()">导出状态 JSON</button>
-  <label style="color:#666">导入状态 <input type="file" accept=".json" onchange="importJson(event)"></label>
-  <span style="color:#999;font-size:12px">状态自动存本浏览器；导出后覆盖 data/tracking.json 可跨设备/重生成保留</span>
+  <span id="filters" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"></span>
+  <button onclick="selectAllStatuses()">全选</button>
+  <button onclick="resetFilter()">重置</button>
+  <span style="display:flex;gap:10px;align-items:center">
+    <button onclick="exportJson()">备份导出</button>
+    <label style="color:#666">恢复 <input type="file" accept=".json" onchange="importJson(event)"></label>
+  </span>
+  <span id="sync" style="color:#999;font-size:12px"></span>
 </div>
 <div id="app"></div>
 <script>
@@ -154,16 +160,29 @@ const ROWS = __ROWS__;
 const STATUSES = __STATUSES__;
 const EXCLUDED = new Set(__EXCLUDED__);
 const LS_KEY = "ustc-jobs-tracking-v1";
-let tracking = {};
-try { tracking = JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch (e) {}
-Object.assign(tracking, __EMBEDDED__);   // 生成时 data/tracking.json 里的状态（localStorage 优先）
-let showExcluded = false;
+const SERVER = location.protocol.startsWith("http");
 
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-function save() { localStorage.setItem(LS_KEY, JSON.stringify(tracking)); updateStats(); }
+// 初始状态：生成时嵌入的 data/tracking.json + 浏览器 localStorage 覆盖
+const lsCache = (() => { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch (e) { return {}; } })();
+let tracking = Object.assign({}, __EMBEDDED__, lsCache);
+// 默认筛选：除"不合适/已挂"外全选
+let selected = new Set(STATUSES.map(s => s[0]).filter(v => !EXCLUDED.has(v)));
+
 function statusOf(key) { return tracking[key] || ""; }
+function save() { localStorage.setItem(LS_KEY, JSON.stringify(tracking)); updateStats(); }
+
+function setSync(t) { const el = document.getElementById("sync"); if (el) el.textContent = t; }
+function postTracking(patch) {
+  if (!SERVER) return Promise.resolve();
+  return fetch("/api/tracking", { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) })
+    .then(r => r.json())
+    .then(() => setSync("已自动保存 " + new Date().toLocaleTimeString()))
+    .catch(() => setSync("⚠️ 自动保存失败：服务未响应，状态暂存浏览器"));
+}
 
 function updateStats() {
   const cnt = {};
@@ -193,22 +212,30 @@ function rowHtml(r) {
 function render() {
   const app = document.getElementById("app");
   app.innerHTML = SECTIONS.map(sec => {
-    const rows = ROWS.filter(r => r.section === sec && (showExcluded || !EXCLUDED.has(statusOf(r.key))));
+    const rows = ROWS.filter(r => r.section === sec && selected.has(statusOf(r.key)));
     if (!rows.length) return "";
     return `<h2>${sec}（${rows.length}）</h2>` + rows.map(rowHtml).join("");
   }).join("");
-  document.getElementById("btn-excluded").textContent =
-    (showExcluded ? "隐藏" : "显示") + "已排除（🚫/❌）";
+}
+
+function renderFilters() {
+  document.getElementById("filters").innerHTML = "筛选：" + STATUSES.map(([v, l]) =>
+    `<button class="chip${selected.has(v) ? " on" : ""}" onclick="toggleStatus('${v}')">${l}</button>`).join("");
+}
+function toggleStatus(v) { selected.has(v) ? selected.delete(v) : selected.add(v); renderFilters(); render(); }
+function selectAllStatuses() { selected = new Set(STATUSES.map(s => s[0])); renderFilters(); render(); }
+function resetFilter() {
+  selected = new Set(STATUSES.map(s => s[0]).filter(v => !EXCLUDED.has(v)));
+  renderFilters(); render();
 }
 
 function setStatus(sel) {
   const key = sel.closest(".card").dataset.key;
   tracking[key] = sel.value;
   save();
+  postTracking({ [key]: sel.value });
   render();
 }
-
-function toggleExcluded() { showExcluded = !showExcluded; render(); }
 
 function exportJson() {
   const blob = new Blob([JSON.stringify(tracking, null, 1)], { type: "application/json" });
@@ -226,7 +253,7 @@ function importJson(ev) {
   reader.onload = () => {
     try {
       Object.assign(tracking, JSON.parse(reader.result));
-      save(); render();
+      save(); postTracking(JSON.parse(reader.result)); render();
       alert("导入成功");
     } catch (e) { alert("导入失败：不是合法 JSON"); }
   };
@@ -234,8 +261,23 @@ function importJson(ev) {
   ev.target.value = "";
 }
 
-save();
-render();
+save(); renderFilters(); render();
+if (SERVER) {
+  setSync("连接服务中…");
+  fetch("/api/tracking").then(r => r.json()).then(serverT => {
+    // 服务器为准；localStorage 里有而服务器没有的键视为旧数据，自动补传（迁移）
+    const missing = {};
+    for (const [k, v] of Object.entries(lsCache)) if (!(k in serverT)) missing[k] = v;
+    if (Object.keys(missing).length) postTracking(missing);
+    tracking = Object.assign({}, lsCache, serverT);
+    save(); render();
+    setSync(Object.keys(missing).length
+      ? "已迁移 " + Object.keys(missing).length + " 条旧状态，自动保存已开启"
+      : "自动保存已开启（改动即时写入 data/tracking.json）");
+  }).catch(() => setSync("⚠️ 服务不可用，状态只存浏览器"));
+} else {
+  setSync("file:// 模式：状态只存浏览器，看页面请先运行 track_server.py");
+}
 </script>
 </body></html>
 """
