@@ -15,6 +15,7 @@
 """
 
 import json
+import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -23,6 +24,9 @@ DATA_DIR = BASE / "data"
 PAGE = DATA_DIR / "apply_mining.html"
 TRACKING_PATH = DATA_DIR / "tracking.json"
 PORT = 8123
+
+# 快速连点时多个 POST 可能并发到达，合并+写盘必须串行，否则读-改-写会互相覆盖
+_write_lock = threading.Lock()
 
 
 def load_tracking() -> dict:
@@ -72,13 +76,15 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             self._send_json({"error": "请求体须为 JSON 对象"}, 400)
             return
-        data = load_tracking()
-        data.update(patch)
-        tmp = TRACKING_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                       encoding="utf-8")
-        tmp.replace(TRACKING_PATH)
-        self._send_json({"ok": True, "count": len(data)})
+        with _write_lock:
+            data = load_tracking()
+            data.update(patch)
+            tmp = TRACKING_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(TRACKING_PATH)
+            count = len(data)
+        self._send_json({"ok": True, "count": count})
 
     def log_message(self, fmt: str, *args) -> None:
         print(f"[tracking] {args[0] if args else fmt}", flush=True)
