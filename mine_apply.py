@@ -280,6 +280,8 @@ def render_html(sections: list[str], rows: list[dict], tracking: dict,
         ("__ROWS__", dumps(rows)),
         ("__STATUSES__", dumps(STATUSES)),
         ("__REGIONS__", dumps(REGIONS)),
+        ("__TERMS__", dumps(sorted({t for r in rows for t in r.get("terms", [])},
+                                  key=lambda t: (t[:4], t[4:]), reverse=True))),
         ("__EXCLUDED__", dumps(sorted(EXCLUDED_STATUSES))),
         ("__EMBEDDED_TRACKING__", dumps(tracking)),
         ("__EMBEDDED_TAGS__", dumps(user_tags)),
@@ -440,6 +442,13 @@ def main():
                 for city, n in s.get("cities", {}).items():
                     cw[city] = cw.get(city, 0) + n
             cities, regions = card_locations(cw, c["name"])
+            terms: list[str] = []  # 场次举办时间 -> "2026秋招"（7-12月秋招，1-6月春招）
+            for s in sess:
+                hd = s.get("hold_date") or ""
+                if len(hd) >= 7:
+                    t = f"{hd[:4]}{'秋招' if int(hd[5:7]) >= 7 else '春招'}"
+                    if t not in terms:
+                        terms.append(t)
             rows.append({
                 "key": c["nkey"],
                 "name": c["name"],
@@ -448,6 +457,8 @@ def main():
                 "tags": sorted(c["tags"]),
                 "cities": cities,
                 "regions": regions,
+                "terms": terms,
+                "term": terms[0] if terms else "",
                 "emails": sorted(c["emails"]),
                 "urls": sorted(c["urls"])[:4],
                 "latest": str(c["latest"]) if c["latest"] else "",
@@ -565,6 +576,7 @@ summary{cursor:pointer;color:#666}
   </div>
   <div class="row" id="statusFilters"></div>
   <div class="row" id="regionFilters"></div>
+  <div class="row" id="termFilters"></div>
   <div class="row" id="tagFilters"></div>
 </div>
 <div id="app"></div>
@@ -573,6 +585,7 @@ const SECTIONS = __SECTIONS__;
 const ROWS = __ROWS__;
 const STATUSES = __STATUSES__;
 const REGIONS = __REGIONS__;
+const TERMS = __TERMS__;
 const EXCLUDED = new Set(__EXCLUDED__);
 const LS_KEY = "ustc-jobs-tracking-v1";
 const LS_TAGS = "ustc-jobs-utags-v1";
@@ -606,6 +619,7 @@ let utags = Object.assign({}, remapKeys(__EMBEDDED_TAGS__), lsU);
 let selectedStatuses = new Set(STATUSES.map(s => s[0]).filter(v => !EXCLUDED.has(v)));
 let selectedTags = new Set();
 let selectedRegions = new Set();  // 空 = 不按 base 区域筛选
+let selectedTerms = new Set();    // 空 = 不按 春招/秋招+年份 筛选
 let query = "";
 let jdHitKeys = new Set();   // JD 全文检索命中的企业键
 
@@ -645,6 +659,12 @@ function updateStats() {
   document.getElementById("regionFilters").innerHTML =
     "<span style='color:#888'>base：</span>" + REGIONS.filter(g => rgCnt[g]).map(g =>
     `<button class="chip${selectedRegions.has(g) ? " on" : ""}" onclick="toggleRegion('${g}')">${g} ${rgCnt[g]}</button>`).join("");
+  // 届次 chips（带计数，新→旧固定顺序）
+  const tmCnt = {};
+  ROWS.forEach(r => (r.terms || []).forEach(t => tmCnt[t] = (tmCnt[t] || 0) + 1));
+  document.getElementById("termFilters").innerHTML =
+    "<span style='color:#888'>届次：</span>" + TERMS.filter(t => tmCnt[t]).map(t =>
+    `<button class="chip${selectedTerms.has(t) ? " on" : ""}" onclick="toggleTerm('${t}')">${t} ${tmCnt[t]}</button>`).join("");
 }
 
 function rowVisible(r) {
@@ -652,6 +672,7 @@ function rowVisible(r) {
   if (!selectedStatuses.has(st)) return false;
   if (selectedTags.size && !allTags(r).some(t => selectedTags.has(t))) return false;
   if (selectedRegions.size && !(r.regions || []).some(g => selectedRegions.has(g))) return false;
+  if (selectedTerms.size && !(r.terms || []).some(t => selectedTerms.has(t))) return false;
   if (query) {
     const q = query.toLowerCase();
     const inRow = (r.name + " " + r.note + " " + r.sessions.map(s => s.theme).join(" ") + " " + allTags(r).join(" ")).toLowerCase().includes(q);
@@ -678,7 +699,7 @@ function rowHtml(r) {
     <select onchange="setStatus(this)">${opts}</select>
     <div class="main">
       <div class="name">${esc(r.name)}${r.n_sessions > 1 ? ` <span style="color:#999;font-size:12px">（共 ${r.n_sessions} 场）</span>` : ""}</div>
-      <div class="meta">${r.cities && r.cities.length ? "📍" + esc(r.cities.join(" · ")) + " ｜ " : ""}${esc(r.latest)} ｜ ${esc(r.note)}</div>
+      <div class="meta">${r.term ? esc(r.term) + " ｜ " : ""}${r.cities && r.cities.length ? "📍" + esc(r.cities.join(" · ")) + " ｜ " : ""}${esc(r.latest)} ｜ ${esc(r.note)}</div>
       <div>${tagsHtml}<input class="tagadd" placeholder="+回车加标签" onkeydown="addUserTag(event,'${esc(r.key)}')"></div>
       <div class="meta">邮箱：${emails}</div>
       ${links ? `<div>${links}</div>` : ""}
@@ -700,6 +721,7 @@ function render() {
 function toggleStatus(v) { selectedStatuses.has(v) ? selectedStatuses.delete(v) : selectedStatuses.add(v); updateStats(); render(); }
 function toggleTag(t) { selectedTags.has(t) ? selectedTags.delete(t) : selectedTags.add(t); updateStats(); render(); }
 function toggleRegion(g) { selectedRegions.has(g) ? selectedRegions.delete(g) : selectedRegions.add(g); updateStats(); render(); }
+function toggleTerm(t) { selectedTerms.has(t) ? selectedTerms.delete(t) : selectedTerms.add(t); updateStats(); render(); }
 
 function setStatus(sel) {
   const key = sel.closest(".card").dataset.key;
