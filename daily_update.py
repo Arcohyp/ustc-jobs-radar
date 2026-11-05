@@ -37,9 +37,11 @@ REPORTS = BASE / "reports"
 COLLECT_RETRIES = 3          # 共尝试 3 次
 COLLECT_RETRY_WAIT = 300     # 每次失败等 5 分钟再试
 
-# 钉钉推送重试（网络/DNS 偶发抖动，避免静默失败）
-NOTIFY_RETRIES = 3           # 共尝试 3 次
-NOTIFY_RETRY_WAIT = 30       # 每次失败等 30 秒再试
+# 钉钉推送重试（网络/DNS 偶发抖动，避免静默失败）。
+# 2026-11 起观察到路由器出口早晨间歇性整体断网，抖动窗口可达数分钟，
+# 重试间隔逐级拉长，覆盖约 13 分钟窗口；仍失败则当天放弃（本地报告已落盘）。
+NOTIFY_RETRIES = 6           # 共尝试 6 次
+NOTIFY_RETRY_BACKOFF = [30, 60, 120, 240, 300]  # 第 2~6 次尝试前的等待秒数
 
 sys.path.insert(0, str(BASE))
 
@@ -53,8 +55,9 @@ def send_notification_with_retry(title: str, content: str, status: str = "succes
         if ok:
             return True
         if attempt < NOTIFY_RETRIES:
-            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] notify failed, retry {attempt+1}/{NOTIFY_RETRIES} in {NOTIFY_RETRY_WAIT}s")
-            time.sleep(NOTIFY_RETRY_WAIT)
+            wait = NOTIFY_RETRY_BACKOFF[attempt - 1]
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] notify failed, retry {attempt+1}/{NOTIFY_RETRIES} in {wait}s")
+            time.sleep(wait)
     return False
 
 MAX_ROWS_PER_SECTION = 15
